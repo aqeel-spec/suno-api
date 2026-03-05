@@ -39,6 +39,12 @@ export const isPage = (target: any): target is Page => {
  */
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
+    // If the controller was already aborted before we were called, resolve immediately
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+
     // Match any CAPTCHA provider's image/resource requests
     const urlPatterns = [
       /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/,       // hCaptcha images

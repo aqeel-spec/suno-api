@@ -18,7 +18,7 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-v3-5';
+export const DEFAULT_MODEL = 'chirp-crow'; // v5 Pro
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -80,6 +80,7 @@ class SunoApi {
   private cookies: Record<string, string | undefined>;
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
+  private keepBrowserOpen = yn(process.env.BROWSER_KEEP_OPEN, { default: false });
   private cursor?: Cursor;
 
   // Concurrency control
@@ -91,6 +92,7 @@ class SunoApi {
   private lastKeepAliveTime = 0;
   private static readonly KEEPALIVE_COOLDOWN_MS = 30_000; // skip refresh if < 30s ago
   private requestCounter = 0;
+  private capturedBrowserModel: string | null = null; // mv field captured from the browser's intercepted generate request
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -101,11 +103,9 @@ class SunoApi {
       headers: {
         'Affiliate-Id': 'undefined',
         'Device-Id': `"${this.deviceId}"`,
-        'x-suno-client': 'Android prerelease-4nt180t 1.0.42',
-        'X-Requested-With': 'com.suno.android',
-        'sec-ch-ua': '"Chromium";v="130", "Android WebView";v="130", "Not?A_Brand";v="99"',
-        'sec-ch-ua-mobile': '?1',
-        'sec-ch-ua-platform': '"Android"',
+        'sec-ch-ua': '"Google Chrome";v="130", "Chromium";v="130", "Not?A_Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"',
         'User-Agent': this.userAgent
       }
     });
@@ -134,7 +134,64 @@ class SunoApi {
     //await this.getClerkLatestVersion();
     await this.getAuthToken();
     await this.keepAlive();
+    await this.logStartupInfo();
     return this;
+  }
+
+  /**
+   * Fetches available Suno models and logs a full startup summary.
+   */
+  private async logStartupInfo(): Promise<void> {
+    // Try to fetch available models from Suno
+    let modelsBlock = '  (could not fetch — models endpoint unavailable)';
+    try {
+      const res = await this.client.get(`${SunoApi.BASE_URL}/api/model_overview/`, { timeout: 8000 });
+      const data = res.data;
+      // Suno returns either an array or an object with a list property
+      const list: any[] = Array.isArray(data) ? data
+        : Array.isArray(data?.models) ? data.models
+        : Array.isArray(data?.data)   ? data.data
+        : [];
+      if (list.length > 0) {
+        modelsBlock = list.map((m: any) => {
+          const id      = m.id ?? m.name ?? m.model_id ?? m.mv ?? JSON.stringify(m);
+          const label   = m.display_name ?? m.title ?? m.label ?? '';
+          const status  = m.status ?? m.state ?? '';
+          const isDefault = id === DEFAULT_MODEL;
+          return `  ${isDefault ? '👉' : '  '} ${id}${label ? ` — ${label}` : ''}${status ? ` [${status}]` : ''}${isDefault ? '  ← DEFAULT' : ''}`;
+        }).join('\n');
+      } else {
+        modelsBlock = `  (endpoint returned no model list — raw: ${JSON.stringify(data).slice(0, 120)})`;
+      }
+    } catch {
+      // Silently fall back — the block stays as the error string above
+    }
+
+    const sep = '═'.repeat(55);
+    const thin = '─'.repeat(55);
+    logger.info(
+      `\n${sep}\n` +
+      `🚀  SUNO-API  —  STARTUP\n` +
+      `${sep}\n` +
+      `⚙️   CONFIGURATION\n` +
+      `${thin}\n` +
+      `🌐  Browser             : ${(process.env.BROWSER ?? 'chromium').toUpperCase()}\n` +
+      `🖥️   Headless            : ${yn(process.env.BROWSER_HEADLESS, { default: true }) ? '✅ Yes (hidden)' : '❌ No (visible window)'}\n` +
+      `🪟  Keep browser open   : ${yn(process.env.BROWSER_KEEP_OPEN, { default: false }) ? '✅ Yes' : '❌ No'}\n` +
+      `🔒  Force CAPTCHA       : ${yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }) ? '✅ Always solve' : '❌ Auto (check endpoint)'}\n` +
+      `👻  Ghost cursor        : ${yn(process.env.BROWSER_GHOST_CURSOR, { default: false }) ? '✅ Yes' : '❌ No'}\n` +
+      `🌍  Browser locale      : ${process.env.BROWSER_LOCALE ?? 'en'}\n` +
+      `🔀  Concurrent limit    : ${process.env.CONCURRENT_LIMIT ?? '3'} request(s)\n` +
+      `⏱️   CAPTCHA UI timeout  : ${process.env.SUNO_CAPTCHA_UI_TIMEOUT_MS ?? '180000'} ms\n` +
+      `⏱️   CAPTCHA token timeout: ${process.env.SUNO_CAPTCHA_TOKEN_TIMEOUT_MS ?? '180000'} ms\n` +
+      `🔑  2Captcha key        : ${process.env.TWOCAPTCHA_KEY ? process.env.TWOCAPTCHA_KEY.slice(0, 6) + '…' + process.env.TWOCAPTCHA_KEY.slice(-4) : '❌ NOT SET'}\n` +
+      `🍪  Cookie present      : ${process.env.SUNO_COOKIE ? '✅' : '❌'} (${process.env.SUNO_COOKIE?.length ?? 0} chars)\n` +
+      `${thin}\n` +
+      `🤖  AVAILABLE MODELS    (default: ${DEFAULT_MODEL})\n` +
+      `${thin}\n` +
+      `${modelsBlock}\n` +
+      `${sep}`
+    );
   }
 
   /**
@@ -308,25 +365,42 @@ class SunoApi {
       headless: yn(process.env.BROWSER_HEADLESS, { default: true })
     });
     const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
-    const cookies = [];
+
+    // Chrome CDP is very strict: cookie names/values must be RFC 6265 safe.
+    // Sanitize names (no controls, no separators) and values (no controls, no ";").
+    const INVALID_NAME_RE  = /[\x00-\x1F\x7F\s"',;\\()\[\]{}@:<>/?=]/;
+    const sanitizeCookieValue = (v: unknown): string | null => {
+      if (v == null || v === '' || v === 'undefined' || v === 'null') return null;
+      const s = String(v).replace(/[\x00-\x1F\x7F]/g, '').replace(/;/g, '');
+      return s.length > 0 ? s : null;
+    };
+
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
-    cookies.push({
-      name: '__session',
-      value: this.currentToken+'',
-      domain: '.suno.com',
-      path: '/',
-      sameSite: lax
-    });
+    const candidates: any[] = [];
+
+    const sessionVal = sanitizeCookieValue(this.currentToken);
+    if (sessionVal)
+      candidates.push({ name: '__session', value: sessionVal, domain: '.suno.com', path: '/', sameSite: lax });
+
     for (const key in this.cookies) {
-      cookies.push({
-        name: key,
-        value: this.cookies[key]+'',
-        domain: '.suno.com',
-        path: '/',
-        sameSite: lax
-      })
+      if (!key || INVALID_NAME_RE.test(key)) continue;       // skip invalid names
+      const val = sanitizeCookieValue(this.cookies[key]);
+      if (!val) continue;
+      candidates.push({ name: key, value: val, domain: '.suno.com', path: '/', sameSite: lax });
     }
-    await context.addCookies(cookies);
+
+    // Add cookies one-by-one; skip any that Chrome still rejects so the browser always opens.
+    let added = 0, skipped = 0;
+    for (const c of candidates) {
+      try {
+        await context.addCookies([c]);
+        added++;
+      } catch {
+        logger.warn(`launchBrowser: skipped invalid cookie "${c.name}" (value len=${c.value.length})`);
+        skipped++;
+      }
+    }
+    logger.info(`launchBrowser: ${added} cookies added, ${skipped} skipped`);
     return context;
   }
 
@@ -416,8 +490,8 @@ class SunoApi {
    * Serialized via captchaMutex so only one browser session runs at a time.
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
-  public async getCaptcha(): Promise<string|null> {
-    if (!await this.captchaRequired())
+  public async getCaptcha(force = false): Promise<string|null> {
+    if (!force && !await this.captchaRequired())
       return null;
 
     // Serialize CAPTCHA solving — only one browser session at a time
@@ -427,7 +501,7 @@ class SunoApi {
 
     try {
       // Re-check after acquiring the lock — a previous caller may have solved it
-      if (!await this.captchaRequired())
+      if (!force && !await this.captchaRequired())
         return null;
 
       return await this._solveCaptcha();
@@ -572,21 +646,35 @@ class SunoApi {
     const controller = new AbortController();
     let rejectOuter: (err: any) => void = () => {};
     let resolveOuter: (token: string | null) => void = () => {};
+    let tokenCaptured = false; // set to true the moment the route intercept fires
 
     const tokenPromise = new Promise<string | null>((resolve, reject) => {
       resolveOuter = resolve;
       rejectOuter = reject;
 
-      // Intercept the generate API call to extract the captcha token
-      page.route('**/api/generate/v2/**', async (route: any) => {
+      // Intercept the generate API call to extract the captcha token.
+      // Match any generate endpoint: v2/, v2-web/, v3/, etc.
+      page.route('**/api/generate/**', async (route: any) => {
         try {
           logger.info('Generate API call intercepted! Extracting token and closing browser');
           const request = route.request();
           this.currentToken = request.headers().authorization?.split('Bearer ').pop();
           const postData = request.postDataJSON();
+          // Capture the model the browser sent so we can mirror it in our API call
+          if (postData?.mv) {
+            this.capturedBrowserModel = postData.mv;
+            logger.info(`Browser model captured: ${postData.mv}`);
+          }
           route.abort();
           controller.abort();
-          browser.browser()?.close();
+          tokenCaptured = true; // signal the sequential flow to short-circuit
+          const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+          if (this.keepBrowserOpen && !isHeadless) {
+            logger.info('[BROWSER_KEEP_OPEN] Browser staying open — close the window manually when done.');
+            page.waitForEvent('close', { timeout: 0 }).finally(() => browser.browser()?.close()).catch(() => {});
+          } else {
+            browser.browser()?.close();
+          }
           resolve(postData?.token || null);
         } catch (err) {
           reject(err);
@@ -597,7 +685,16 @@ class SunoApi {
     // Click the button to trigger generation (and hopefully a CAPTCHA)
     logger.info('Clicking Create button');
     await this.click(button);
-    await new Promise(r => setTimeout(r, 3000)); // wait for CAPTCHA to appear
+
+    // Wait up to 3s — exit immediately if the token was already captured
+    await Promise.race([
+      tokenPromise.catch(() => {}),
+      new Promise(r => setTimeout(r, 3000)),
+    ]);
+    if (tokenCaptured) {
+      logger.info('Token captured immediately after button click — skipping CAPTCHA detection');
+      return tokenPromise;
+    }
 
     // --- Debug snapshot: after Create click ---
     await this.saveDebugSnapshot(page, '05-after-create-click', requestLog);
@@ -606,26 +703,36 @@ class SunoApi {
     logger.info('Waiting for CAPTCHA challenge to appear...');
     let captchaType = await this.waitForCaptchaFrame(page, 15000);
 
+    // Re-check after CAPTCHA wait in case token appeared without a CAPTCHA challenge
+    if (!captchaType && tokenCaptured) {
+      logger.info('Token captured during CAPTCHA wait — no CAPTCHA challenge needed');
+      return tokenPromise;
+    }
+
     if (!captchaType) {
       // Try clicking the button again — sometimes the first click is swallowed
       logger.warn('No CAPTCHA detected after first click. Retrying...');
       await this.click(button);
-      await new Promise(r => setTimeout(r, 5000));
+
+      // Wait up to 5s — exit immediately if token captured on retry click
+      await Promise.race([
+        tokenPromise.catch(() => {}),
+        new Promise(r => setTimeout(r, 5000)),
+      ]);
+      if (tokenCaptured) {
+        logger.info('Token captured after retry click — skipping CAPTCHA detection');
+        await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
+        return tokenPromise;
+      }
+
       await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
       captchaType = await this.waitForCaptchaFrame(page, 20000);
     }
 
     if (!captchaType) {
-      // Check if the generate API was called without a CAPTCHA (maybe CAPTCHA wasn't needed after all)
-      logger.warn('No CAPTCHA iframe found. Checking if generation proceeded without CAPTCHA...');
-      // Give the tokenPromise a chance to resolve
-      const raceResult = await Promise.race([
-        tokenPromise.then(t => ({ type: 'token' as const, value: t })),
-        new Promise<{ type: 'timeout' }>(r => setTimeout(() => r({ type: 'timeout' }), 10000)),
-      ]);
-      if (raceResult.type === 'token') {
-        logger.info('Generation proceeded without visible CAPTCHA');
-        return raceResult.value;
+      if (tokenCaptured) {
+        logger.info('Token captured during extended CAPTCHA wait');
+        return tokenPromise;
       }
 
       // Truly no CAPTCHA and no generation
@@ -724,7 +831,12 @@ class SunoApi {
           });
         }
       } catch (e: any) {
-        if (e.message.includes('been closed') || e.message === 'AbortError')
+        if (
+          e.message.includes('been closed') ||
+          e.message === 'AbortError' ||
+          e.message.includes('No CAPTCHA image') || // signal was already aborted before waitForRequests was called
+          e.message.includes('Target closed')  // browser closed while we were in the loop
+        )
           resolve();
         else
           reject(e);
@@ -882,13 +994,12 @@ class SunoApi {
       await this.keepAlive();
     const payload: any = {
       make_instrumental: make_instrumental,
-      mv: model || DEFAULT_MODEL,
+      mv: model || DEFAULT_MODEL, // placeholder — overwritten after getCaptcha() captures browser model
       prompt: '',
       generation_type: 'TEXT',
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
       task: task,
-      token: await this.getCaptcha()
     };
     if (isCustom) {
       payload.tags = tags;
@@ -898,30 +1009,57 @@ class SunoApi {
     } else {
       payload.gpt_description_prompt = prompt;
     }
+
+    payload.token = await this.getCaptcha(yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }));
+
+    // Use in order of preference: caller-supplied model → browser-captured model (set during getCaptcha) → DEFAULT_MODEL
+    const resolvedModel = model || this.capturedBrowserModel || DEFAULT_MODEL;
+    payload.mv = resolvedModel;
+
+    const tokenPreview = payload.token
+      ? `✅ ${payload.token.slice(0, 12)}…${payload.token.slice(-6)} (len:${payload.token.length})`
+      : '❌ null (no CAPTCHA token)';
+
+    const sep = '─'.repeat(55);
     logger.info(
-      `[req-${reqId}] generateSongs payload:\n` +
-        JSON.stringify(
-          {
-            prompt: prompt,
-            isCustom: isCustom,
-            tags: tags,
-            title: title,
-            make_instrumental: make_instrumental,
-            wait_audio: wait_audio,
-            negative_tags: negative_tags,
-            payload: payload
-          },
-          null,
-          2
-        )
+      `\n${sep}\n` +
+      `🎵  GENERATE REQUEST  [req-${reqId}]\n` +
+      `${sep}\n` +
+      `🆔  Request ID        : ${reqId}\n` +
+      `🤖  Mode              : ${isCustom ? '🎨 Custom (manual style)' : '✨ Auto (AI description)'}\n` +
+      `🧠  Model / Version   : ${resolvedModel}${this.capturedBrowserModel && !model ? ' (from browser)' : ''}\n` +
+      `📝  Prompt            : ${prompt ? `"${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"` : '(none)'}\n` +
+      `🎼  Title             : ${title || '(not set)'}\n` +
+      `🎸  Style / Tags      : ${tags || '(not set)'}\n` +
+      `🚫  Negative Tags     : ${negative_tags || '(none)'}\n` +
+      `🎹  Instrumental      : ${make_instrumental ? '✅ Yes' : '❌ No (with vocals)'}\n` +
+      `⏳  Wait for audio    : ${wait_audio ? '✅ Yes (blocking)' : '❌ No (async)'}\n` +
+      `🔧  Task              : ${task || 'generate (default)'}\n` +
+      `🔗  Continue clip ID  : ${continue_clip_id || '(none)'}\n` +
+      `⏱️  Continue at       : ${continue_at != null ? `${continue_at}s` : '(none)'}\n` +
+      `🛡️  CAPTCHA token     : ${tokenPreview}\n` +
+      `${sep}`
     );
-    const response = await this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2/`,
+
+    const doGenerate = () => this.client.post(
+      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
       payload,
-      {
-        timeout: 10000 // 10 seconds timeout
-      }
+      { timeout: 10000 }
     );
+
+    // If the API rejects our token (or null token) with 422, force-solve CAPTCHA and retry once.
+    const response = await doGenerate().catch(async (err: any) => {
+      const status = err?.response?.status ?? err?.status;
+      const detail: string = (err?.response?.data?.detail ?? '').toLowerCase();
+      if (status === 422 || detail.includes('token')) {
+        logger.warn(`[req-${reqId}] Generate got ${status} ("${err?.response?.data?.detail}") — force-solving CAPTCHA and retrying`);
+        payload.token = await this.getCaptcha(true);
+        if (!payload.token) throw new Error('Force-solve CAPTCHA returned null — cannot proceed.');
+        return doGenerate();
+      }
+      throw err;
+    });
+
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
