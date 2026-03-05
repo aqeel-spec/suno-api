@@ -747,101 +747,170 @@ class SunoApi {
 
     logger.info(`Detected CAPTCHA type: ${captchaType}`);
 
-    if (captchaType !== 'hcaptcha') {
-      // We only support hCaptcha via 2Captcha right now
+    // --- Step 4: Solve CAPTCHA ---
+    let captchaSolverPromise: Promise<void>;
+
+    if (captchaType === 'hcaptcha') {
+      // --- Solve hCaptcha challenges in a loop ---
+      logger.info('Starting hCaptcha solving loop');
+      captchaSolverPromise = new Promise<void>(async (resolve, reject) => {
+        const frame = page.frameLocator('iframe[title*="hCaptcha"]');
+        const challenge = frame.locator('.challenge-container');
+        try {
+          // First iteration: challenge is already loaded (images already fetched), skip waitForRequests.
+          // Subsequent iterations: wait for the new challenge images to load after each submission.
+          let wait = false;
+          while (true) {
+            if (wait)
+              await waitForRequests(page, controller.signal);
+            // Wait for the challenge container to be fully rendered before interacting
+            await challenge.waitFor({ state: 'visible', timeout: 60000 });
+            const promptText = await challenge.locator('.prompt-text').first().innerText({ timeout: 15000 }).catch(() => '');
+            const drag = promptText.toLowerCase().includes('drag');
+            let captcha: any;
+            for (let j = 0; j < 3; j++) {
+              try {
+                logger.info('Sending the CAPTCHA to 2Captcha');
+                const payload: paramsCoordinates = {
+                  body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
+                  lang: process.env.BROWSER_LOCALE
+                };
+                if (drag) {
+                  payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
+                  payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
+                }
+                captcha = await this.solver.coordinates(payload);
+                break;
+              } catch (err: any) {
+                logger.info(err.message);
+                if (j !== 2)
+                  logger.info('Retrying...');
+                else
+                  throw err;
+              }
+            }
+            if (drag) {
+              const challengeBox = await challenge.boundingBox();
+              if (challengeBox == null)
+                throw new Error('.challenge-container boundingBox is null!');
+              if (captcha.data.length % 2) {
+                logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
+                this.solver.badReport(captcha.id);
+                wait = false;
+                continue;
+              }
+              for (let i = 0; i < captcha.data.length; i += 2) {
+                const data1 = captcha.data[i];
+                const data2 = captcha.data[i + 1];
+                logger.info(JSON.stringify(data1) + JSON.stringify(data2));
+                await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
+                await page.mouse.down();
+                await sleep(1.1);
+                await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
+                await page.mouse.up();
+              }
+              wait = true;
+            } else {
+              for (const data of captcha.data) {
+                logger.info(data);
+                await this.click(challenge, { x: +data.x, y: +data.y });
+              }
+              wait = true; // Wait for new challenge images after submit
+            }
+            this.click(frame.locator('.button-submit')).catch(e => {
+              if (e.message.includes('viewport'))
+                this.click(button);
+              else
+                throw e;
+            });
+          }
+        } catch (e: any) {
+          if (
+            e.message.includes('been closed') ||
+            e.message === 'AbortError' ||
+            e.message.includes('No CAPTCHA image') || // signal was already aborted before waitForRequests was called
+            e.message.includes('Target closed')  // browser closed while we were in the loop
+          )
+            resolve();
+          else
+            reject(e);
+        }
+      });
+
+    } else if (captchaType === 'turnstile') {
+      // --- Solve Cloudflare Turnstile via 2Captcha ---
+      logger.info('Starting Turnstile solving via 2Captcha');
+
+      // Extract the sitekey from the DOM or from the Turnstile iframe URL
+      let sitekey: string | null = await page.evaluate(() => {
+        const el = document.querySelector('[data-sitekey]');
+        return el ? el.getAttribute('data-sitekey') : null;
+      }).catch(() => null);
+
+      if (!sitekey) {
+        for (const frame of page.frames()) {
+          const url = frame.url();
+          if (url.includes('challenges.cloudflare.com') || url.includes('turnstile')) {
+            // Sitekey appears as a path segment, typically prefixed with 0x
+            const match = url.match(/\/(0x[0-9a-zA-Z_-]{10,})\//i) || url.match(/\/([0-9a-zA-Z_-]{20,})\//);
+            if (match) { sitekey = match[1]; break; }
+          }
+        }
+      }
+
+      if (!sitekey) {
+        await this.saveDebugSnapshot(page, '08-turnstile-no-sitekey', requestLog);
+        await browser.browser()?.close();
+        throw new Error('Could not extract Turnstile sitekey from the page. Check debug/ folder for details.');
+      }
+
+      logger.info(`Extracted Turnstile sitekey: ${sitekey}`);
+      const resolvedSitekey = sitekey;
+
+      captchaSolverPromise = new Promise<void>(async (resolve, reject) => {
+        try {
+          logger.info('Sending Turnstile CAPTCHA to 2Captcha');
+          const result = await this.solver.cloudflareTurnstile({
+            pageurl: 'https://suno.com/create',
+            sitekey: resolvedSitekey,
+          });
+
+          logger.info(`Turnstile CAPTCHA solved by 2Captcha (token: ${result.data.slice(0, 20)}…)`);
+
+          // We have the CAPTCHA token directly from 2Captcha — resolve the outer
+          // promise immediately. this.currentToken (JWT) was already refreshed by
+          // keepAlive() before the browser launched, so no route-intercept is needed.
+          tokenCaptured = true;
+          controller.abort();
+          const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+          if (this.keepBrowserOpen && !isHeadless) {
+            logger.info('[BROWSER_KEEP_OPEN] Browser staying open — close the window manually when done.');
+            page.waitForEvent('close', { timeout: 0 }).finally(() => browser.browser()?.close()).catch(() => {});
+          } else {
+            browser.browser()?.close();
+          }
+          resolveOuter(result.data);
+          resolve();
+        } catch (e: any) {
+          if (
+            e.message.includes('been closed') ||
+            e.message === 'AbortError' ||
+            e.message.includes('Target closed')
+          )
+            resolve();
+          else
+            reject(e);
+        }
+      });
+
+    } else {
       await this.saveDebugSnapshot(page, '08-unsupported-captcha', requestLog);
       await browser.browser()?.close();
       throw new Error(
         `Detected CAPTCHA type "${captchaType}" which is not currently supported. `
-        + 'Only hCaptcha is supported via 2Captcha. Check debug/ folder for details.'
+        + 'Only hCaptcha and Turnstile are supported via 2Captcha. Check debug/ folder for details.'
       );
     }
-
-    // --- Step 4: Solve hCaptcha challenges in a loop ---
-    logger.info('Starting hCaptcha solving loop');
-    const captchaSolverPromise = new Promise<void>(async (resolve, reject) => {
-      const frame = page.frameLocator('iframe[title*="hCaptcha"]');
-      const challenge = frame.locator('.challenge-container');
-      try {
-        // First iteration: challenge is already loaded (images already fetched), skip waitForRequests.
-        // Subsequent iterations: wait for the new challenge images to load after each submission.
-        let wait = false;
-        while (true) {
-          if (wait)
-            await waitForRequests(page, controller.signal);
-          // Wait for the challenge container to be fully rendered before interacting
-          await challenge.waitFor({ state: 'visible', timeout: 60000 });
-          const promptText = await challenge.locator('.prompt-text').first().innerText({ timeout: 15000 }).catch(() => '');
-          const drag = promptText.toLowerCase().includes('drag');
-          let captcha: any;
-          for (let j = 0; j < 3; j++) {
-            try {
-              logger.info('Sending the CAPTCHA to 2Captcha');
-              const payload: paramsCoordinates = {
-                body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
-                lang: process.env.BROWSER_LOCALE
-              };
-              if (drag) {
-                payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
-                payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
-              }
-              captcha = await this.solver.coordinates(payload);
-              break;
-            } catch (err: any) {
-              logger.info(err.message);
-              if (j !== 2)
-                logger.info('Retrying...');
-              else
-                throw err;
-            }
-          }
-          if (drag) {
-            const challengeBox = await challenge.boundingBox();
-            if (challengeBox == null)
-              throw new Error('.challenge-container boundingBox is null!');
-            if (captcha.data.length % 2) {
-              logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
-              this.solver.badReport(captcha.id);
-              wait = false;
-              continue;
-            }
-            for (let i = 0; i < captcha.data.length; i += 2) {
-              const data1 = captcha.data[i];
-              const data2 = captcha.data[i + 1];
-              logger.info(JSON.stringify(data1) + JSON.stringify(data2));
-              await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
-              await page.mouse.down();
-              await sleep(1.1);
-              await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
-              await page.mouse.up();
-            }
-            wait = true;
-          } else {
-            for (const data of captcha.data) {
-              logger.info(data);
-              await this.click(challenge, { x: +data.x, y: +data.y });
-            }
-            wait = true; // Wait for new challenge images after submit
-          }
-          this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport'))
-              this.click(button);
-            else
-              throw e;
-          });
-        }
-      } catch (e: any) {
-        if (
-          e.message.includes('been closed') ||
-          e.message === 'AbortError' ||
-          e.message.includes('No CAPTCHA image') || // signal was already aborted before waitForRequests was called
-          e.message.includes('Target closed')  // browser closed while we were in the loop
-        )
-          resolve();
-        else
-          reject(e);
-      }
-    });
 
     // Wire captcha solver errors into the token promise
     captchaSolverPromise.catch(e => {
@@ -1011,6 +1080,9 @@ class SunoApi {
     }
 
     payload.token = await this.getCaptcha(yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }));
+
+    // Refresh JWT in case the captcha session took long enough to stale it
+    await this.keepAlive();
 
     // Use in order of preference: caller-supplied model → browser-captured model (set during getCaptcha) → DEFAULT_MODEL
     const resolvedModel = model || this.capturedBrowserModel || DEFAULT_MODEL;
