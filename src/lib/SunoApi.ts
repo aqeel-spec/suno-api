@@ -39,6 +39,20 @@ export interface AudioInfo {
   error_message?: string; // Error message if any
 }
 
+/**
+ * Advanced generation options matching Suno's "More Options" panel.
+ */
+export interface AdvancedOptions {
+  /** Vocal gender preference: "male" or "female". Omit for no preference. */
+  vocal_gender?: 'male' | 'female';
+  /** Weirdness / creativity constraint (0.0 to 1.0, default ~0.5). */
+  weirdness?: number;
+  /** Style influence / weight (0.0 to 1.0, default ~0.5). */
+  style_influence?: number;
+  /** Persona UUID to use for voice cloning. */
+  persona_id?: string;
+}
+
 interface PersonaResponse {
   persona: {
     id: string;
@@ -83,6 +97,10 @@ class SunoApi {
   private keepBrowserOpen = yn(process.env.BROWSER_KEEP_OPEN, { default: false });
   private cursor?: Cursor;
 
+  // Persistent browser for reuse across requests (when BROWSER_KEEP_OPEN=true)
+  private _browserContext: BrowserContext | null = null;
+  private _browserPage: Page | null = null;
+
   // Concurrency control
   private keepAliveMutex = new AsyncMutex();
   private captchaMutex = new AsyncMutex();
@@ -93,6 +111,9 @@ class SunoApi {
   private static readonly KEEPALIVE_COOLDOWN_MS = 30_000; // skip refresh if < 30s ago
   private requestCounter = 0;
   private capturedBrowserModel: string | null = null; // mv field captured from the browser's intercepted generate request
+  private capturedBrowserEndpoint: string | null = null; // generate endpoint path captured from the browser's intercepted request
+  private capturedSoundsEndpoint: string | null = null; // sounds endpoint path captured from the browser's intercepted request
+  private capturedTurnstileSitekey: string | null = null; // Turnstile sitekey captured from network requests
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -324,6 +345,314 @@ class SunoApi {
   }
 
   /**
+   * Fill a React controlled input/textarea reliably.
+   *
+   * The core problem: React installs an instance-level `value` property
+   * descriptor on controlled inputs. When onChange fires, React reads
+   * `e.target.value` through this instance getter, which returns React's
+   * internal tracked value (the OLD state), not the DOM value we just set.
+   * So `setState(e.target.value)` sets state to "" and the textarea stays empty.
+   *
+   * Approach 1 — Override instance getter + native setter + _valueTracker reset.
+   * We temporarily override React's instance `value` getter to return our
+   * new value, then dispatch events. When React's onChange reads
+   * `e.target.value`, it gets OUR value, and setState works correctly.
+   *
+   * Approach 2 — ClipboardEvent paste with synthetic clipboardData.
+   * Suno's textarea may handle paste events by reading clipboardData
+   * rather than target.value, bypassing the instance getter issue.
+   *
+   * Approach 3 — Direct React fiber state setter dispatch.
+   * Walk the fiber tree to find the useState hook managing this textarea
+   * and call the dispatch function directly to set React state.
+   *
+   * NOTE: keyboard.type() is NOT used — it sends individual keydown/keyup
+   * events that trigger Suno's keyboard shortcuts. keyboard.insertText() is
+   * preferred (used in the caller) because it uses the browser's native text
+   * input pipeline without firing key events. This reactFill method serves as
+   * a fallback when insertText doesn't work.
+   */
+  private async reactFill(locator: Locator, value: string): Promise<void> {
+    // --- Approach 1: Override instance value getter + native setter + _valueTracker ---
+    await locator.focus();
+    await new Promise(r => setTimeout(r, 100));
+    const diag1 = await locator.evaluate((el: Element, v: string) => {
+      const textarea = el as HTMLTextAreaElement;
+      const proto = el.tagName === 'TEXTAREA'
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      const nativeGetter = Object.getOwnPropertyDescriptor(proto, 'value')?.get;
+      const hasTracker = '_valueTracker' in el;
+      const hasInstanceValue = el.hasOwnProperty('value');
+      const isFocused = document.activeElement === el;
+      const reactKeys = Object.keys(el).filter(k => k.startsWith('__react'));
+
+      textarea.focus();
+
+      // Step 1: Set the DOM value via native prototype setter
+      if (nativeSetter) nativeSetter.call(el, v);
+      else textarea.value = v;
+
+      // Step 2: Read DOM value via native getter to verify it was set
+      const domValue = nativeGetter ? nativeGetter.call(el) : '';
+
+      // Step 3: If React has an instance-level value descriptor, temporarily
+      // override its getter to return our new value. This is critical because
+      // React's onChange handler reads `e.target.value` through this getter.
+      const instanceDesc = Object.getOwnPropertyDescriptor(el, 'value');
+      let overrodeGetter = false;
+      if (instanceDesc && instanceDesc.configurable) {
+        Object.defineProperty(el, 'value', {
+          get: function() { return v; },
+          set: instanceDesc.set || function(val: string) {
+            if (nativeSetter) nativeSetter.call(el, val);
+          },
+          configurable: true,
+          enumerable: instanceDesc.enumerable ?? true,
+        });
+        overrodeGetter = true;
+      } else if (hasInstanceValue) {
+        // Instance property but not configurable — try deleting it
+        try {
+          delete (el as any).value;
+          if (nativeSetter) nativeSetter.call(el, v);
+          overrodeGetter = true;
+        } catch {}
+      }
+
+      // Step 4: Reset React's internal value tracker
+      if (hasTracker) {
+        (el as any)._valueTracker.setValue('');
+      }
+
+      // Step 5: Dispatch InputEvent — React's event delegation handles this
+      // React's onChange handler fires synchronously during dispatchEvent and reads
+      // e.target.value through our overridden getter, getting our value.
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: false,
+        inputType: 'insertText',
+        data: v,
+      }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Step 6: Restore the original descriptor so React can manage the element again.
+      // React's onChange already ran synchronously during dispatchEvent above and
+      // captured our value. Now let React reinstall its own descriptor on re-render.
+      if (overrodeGetter && instanceDesc) {
+        try {
+          Object.defineProperty(el, 'value', instanceDesc);
+        } catch {
+          // If we can't restore, at least delete our override
+          try { delete (el as any).value; } catch {}
+        }
+      }
+
+      // Read what el.value returns now (through whatever getter is active)
+      const readbackValue = textarea.value;
+
+      return {
+        hasNativeSetter: !!nativeSetter,
+        hasTracker,
+        hasInstanceValue,
+        isFocused,
+        overrodeGetter,
+        domValue: domValue?.substring(0, 40) || '',
+        readbackValue: readbackValue?.substring(0, 40) || '',
+        reactKeys: reactKeys.join(','),
+      };
+    }, value);
+    logger.info(
+      `reactFill[1] diag: setter=${diag1.hasNativeSetter}, tracker=${diag1.hasTracker}, ` +
+      `instanceValue=${diag1.hasInstanceValue}, overrodeGetter=${diag1.overrodeGetter}, ` +
+      `focused=${diag1.isFocused}, domValue="${diag1.domValue}", ` +
+      `readback="${diag1.readbackValue}", keys=[${diag1.reactKeys}]`
+    );
+
+    // Wait for React to process the event and re-render
+    await new Promise(r => setTimeout(r, 500));
+    const val1 = await locator.evaluate((el: Element, v: string) => {
+      // Read via native getter to check DOM value
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeGetter = Object.getOwnPropertyDescriptor(proto, 'value')?.get;
+      const domValue = nativeGetter ? nativeGetter.call(el) : '';
+      const instanceValue = (el as HTMLTextAreaElement).value || '';
+
+      // Also check React fiber state directly — this is the ground truth
+      let fiberValue: string | null = null;
+      const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+      if (fiberKey) {
+        let fiber = (el as any)[fiberKey];
+        // Walk up the fiber tree to find the component that owns this textarea
+        for (let i = 0; i < 15 && fiber; i++) {
+          if (fiber.memoizedState) {
+            let hook = fiber.memoizedState;
+            while (hook) {
+              if (hook.queue && typeof hook.memoizedState === 'string') {
+                if (hook.memoizedState === v) {
+                  fiberValue = hook.memoizedState;
+                  break;
+                }
+              }
+              hook = hook.next;
+            }
+            if (fiberValue) break;
+          }
+          fiber = fiber.return;
+        }
+      }
+
+      return { domValue, instanceValue, fiberValue };
+    }, value).catch(() => ({ domValue: '', instanceValue: '', fiberValue: null as string | null }));
+
+    if (val1.fiberValue === value || val1.instanceValue === value || val1.domValue === value) {
+      logger.info(
+        `reactFill: approach 1 succeeded (dom="${val1.domValue?.substring(0, 20)}", ` +
+        `instance="${val1.instanceValue?.substring(0, 20)}", ` +
+        `fiber=${val1.fiberValue ? 'matched' : 'null'})`
+      );
+      return;
+    }
+    logger.warn(
+      `reactFill[1] after render: dom="${(val1.domValue || '').substring(0, 30)}", ` +
+      `instance="${(val1.instanceValue || '').substring(0, 30)}", ` +
+      `fiber=${val1.fiberValue ? 'matched' : 'null'} — trying paste`
+    );
+
+    // --- Approach 2: ClipboardEvent paste ---
+    await locator.focus();
+    await new Promise(r => setTimeout(r, 100));
+    const diag2 = await locator.evaluate((el: Element, v: string) => {
+      const textarea = el as HTMLTextAreaElement;
+      textarea.focus();
+      textarea.select();
+
+      // Create a DataTransfer with our text
+      const dt = new DataTransfer();
+      dt.setData('text/plain', v);
+      const pasteEvent = new ClipboardEvent('paste', {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: dt,
+      });
+      const dispatched = el.dispatchEvent(pasteEvent);
+
+      // If paste was not prevented, the browser should insert the text.
+      // For React controlled components, the paste handler likely reads
+      // clipboardData and calls setState.
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeGetter = Object.getOwnPropertyDescriptor(proto, 'value')?.get;
+      return {
+        dispatched,
+        domValue: (nativeGetter ? nativeGetter.call(el) : '')?.substring(0, 40) || '',
+        instanceValue: textarea.value?.substring(0, 40) || '',
+      };
+    }, value);
+    logger.info(
+      `reactFill[2] paste: dispatched=${diag2.dispatched}, ` +
+      `dom="${diag2.domValue}", instance="${diag2.instanceValue}"`
+    );
+
+    await new Promise(r => setTimeout(r, 500));
+    const val2 = await locator.evaluate((el: Element) => {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeGetter = Object.getOwnPropertyDescriptor(proto, 'value')?.get;
+      return {
+        domValue: nativeGetter ? nativeGetter.call(el) : '',
+        instanceValue: (el as HTMLTextAreaElement).value || '',
+      };
+    }).catch(() => ({ domValue: '', instanceValue: '' }));
+    if (val2.instanceValue === value || val2.domValue === value) {
+      logger.info('reactFill: paste approach succeeded');
+      return;
+    }
+    logger.warn(
+      `reactFill[2] after delay: dom="${(val2.domValue || '').substring(0, 30)}", ` +
+      `instance="${(val2.instanceValue || '').substring(0, 30)}" — trying fiber setState`
+    );
+
+    // --- Approach 3: Direct React fiber state setter ---
+    const diag3 = await locator.evaluate((el: Element, v: string) => {
+      // Walk the fiber tree to find all useState hooks and try setting the value
+      const fiberKey = Object.keys(el).find(
+        k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$')
+      );
+      if (!fiberKey) return { found: false, reason: 'no fiber key' };
+
+      let dispatched = false;
+      let fiber = (el as any)[fiberKey];
+      // Walk up the tree to find the component managing this textarea's state
+      for (let depth = 0; depth < 20 && fiber; depth++) {
+        // Function components (tag=0) have hooks in memoizedState
+        if (fiber.tag === 0 && fiber.memoizedState) {
+          // Walk the linked list of hooks
+          let hook = fiber.memoizedState;
+          let hookIndex = 0;
+          while (hook) {
+            // useState/useReducer hooks have a queue with dispatch
+            if (hook.queue && typeof hook.queue.dispatch === 'function') {
+              // Check if this hook's state looks like it could be the textarea value
+              // (it's a string, and either empty or matches current value pattern)
+              const currentVal = hook.memoizedState;
+              if (typeof currentVal === 'string') {
+                hook.queue.dispatch(v);
+                dispatched = true;
+              }
+            }
+            hook = hook.next;
+            hookIndex++;
+          }
+        }
+
+        // Also try calling onChange on __reactProps$ with a proper mock event
+        const propsKey = Object.keys(fiber.stateNode || {}).find?.(
+          k => k.startsWith('__reactProps$')
+        );
+        if (propsKey && fiber.stateNode) {
+          const props = (fiber.stateNode as any)[propsKey];
+          if (typeof props?.onChange === 'function') {
+            // Create a mock event where target.value returns our value
+            const mockTarget = Object.create(el, {
+              value: { get: () => v, configurable: true },
+            });
+            props.onChange({
+              target: mockTarget,
+              currentTarget: mockTarget,
+              type: 'change',
+              preventDefault: () => {},
+              stopPropagation: () => {},
+            });
+            dispatched = true;
+          }
+        }
+
+        fiber = fiber.return;
+      }
+      return { found: true, dispatched };
+    }, value);
+    logger.info(`reactFill[3] fiber setState: ${JSON.stringify(diag3)}`);
+
+    await new Promise(r => setTimeout(r, 500));
+    const val3 = await locator.evaluate((el: Element) => {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const nativeGetter = Object.getOwnPropertyDescriptor(proto, 'value')?.get;
+      return {
+        domValue: nativeGetter ? nativeGetter.call(el) : '',
+        instanceValue: (el as HTMLTextAreaElement).value || '',
+      };
+    }).catch(() => ({ domValue: '', instanceValue: '' }));
+    if (val3.instanceValue === value || val3.domValue === value) {
+      logger.info('reactFill: fiber setState succeeded');
+    } else {
+      logger.warn(
+        `reactFill: ALL approaches failed — dom="${(val3.domValue || '').substring(0, 30)}", ` +
+        `instance="${(val3.instanceValue || '').substring(0, 30)}"`
+      );
+    }
+  }
+
+  /**
    * Get the BrowserType from the `BROWSER` environment variable.
    * @returns {BrowserType} chromium, firefox or webkit. Default is chromium
    */
@@ -454,7 +783,7 @@ class SunoApi {
       const frames = page.frames();
       for (const frame of frames) {
         const url = frame.url().toLowerCase();
-        if (url.includes('hcaptcha.com')) return 'hcaptcha';
+        if (url.includes('hcaptcha.com') || url.includes('hcaptcha-endpoint-prod.suno.com') || url.includes('hcaptcha-assets-prod.suno.com')) return 'hcaptcha';
         if (url.includes('google.com/recaptcha') || url.includes('recaptcha')) return 'recaptcha';
         if (url.includes('challenges.cloudflare.com') || url.includes('turnstile')) return 'turnstile';
         if (url.includes('arkoselabs.com') || url.includes('funcaptcha')) return 'arkose';
@@ -490,8 +819,9 @@ class SunoApi {
    * Serialized via captchaMutex so only one browser session runs at a time.
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
-  public async getCaptcha(force = false): Promise<string|null> {
-    if (!force && !await this.captchaRequired())
+  public async getCaptcha(force = false, tabMode: 'advanced' | 'sounds' = 'advanced'): Promise<string|null> {
+    const isForced = force;
+    if (!isForced && !await this.captchaRequired())
       return null;
 
     // Serialize CAPTCHA solving — only one browser session at a time
@@ -504,7 +834,10 @@ class SunoApi {
       if (!force && !await this.captchaRequired())
         return null;
 
-      return await this._solveCaptcha();
+      // Always use the browser flow — externally-solved Turnstile tokens (via 2Captcha)
+      // are rejected by Suno because they lack the proper Cloudflare session binding.
+      // The browser's own invisible Turnstile produces tokens that Suno's backend accepts.
+      return await this._solveCaptcha(tabMode);
     } finally {
       releaseCaptcha();
     }
@@ -513,18 +846,54 @@ class SunoApi {
   /**
    * Internal CAPTCHA-solving logic (called under captchaMutex).
    */
-  private async _solveCaptcha(): Promise<string|null> {
+  private async _solveCaptcha(tabMode: 'advanced' | 'sounds' = 'advanced'): Promise<string|null> {
 
-    logger.info('CAPTCHA required. Launching browser...');
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
+    let browser!: BrowserContext;
+    let page!: Page;
+    let reused = false;
+
+    // Try to reuse an existing browser from a previous BROWSER_KEEP_OPEN session
+    if (this._browserContext && this._browserPage) {
+      try {
+        // Quick check: is the browser still alive?
+        await this._browserPage.evaluate(() => document.title);
+        browser = this._browserContext;
+        page = this._browserPage;
+        reused = true;
+        logger.info('Reusing existing browser from previous request');
+      } catch {
+        // Browser was closed or crashed — clean up and launch fresh
+        logger.info('Previous browser is no longer available — launching new one');
+        try { await this._browserContext.browser()?.close(); } catch {}
+        this._browserContext = null;
+        this._browserPage = null;
+      }
+    }
+
+    if (!reused) {
+      logger.info('CAPTCHA required. Launching browser...');
+      browser = await this.launchBrowser();
+      page = await browser.newPage();
+    }
 
     // Collect ALL network requests for debugging
     const requestLog: string[] = [];
+    // On reuse, remove old route handlers to avoid stale callbacks
+    if (reused) {
+      await page.unroute('**/api/generate/**').catch(() => {});
+    }
     page.on('request', (req: any) => {
       const url: string = req.url();
       if (!url.startsWith('data:') && !url.endsWith('.woff2') && !url.endsWith('.woff'))
         requestLog.push(`[${new Date().toISOString()}] ${req.method()} ${url}`);
+      // Capture Turnstile sitekey from Cloudflare challenge-platform URLs
+      if (url.includes('challenges.cloudflare.com') && !this.capturedTurnstileSitekey) {
+        const m = url.match(/\/(0x[0-9a-zA-Z_-]{10,})\//);
+        if (m) {
+          this.capturedTurnstileSitekey = m[1];
+          logger.info(`Captured Turnstile sitekey from network request: ${m[1]}`);
+        }
+      }
     });
 
     await page.goto('https://suno.com/create', {
@@ -586,35 +955,113 @@ class SunoApi {
       logger.warn(`Failed to enumerate interactive elements: ${e.message}`);
     }
 
-    // --- Step 1: Find and fill prompt input ---
-    logger.info('Looking for prompt input');
-    const promptSelectors = [
-      '.custom-textarea',
-      'textarea[placeholder*="lyrics" i]',
-      'textarea[placeholder*="describe" i]',
-      'textarea[placeholder*="song" i]',
-      'textarea[placeholder*="prompt" i]',
-      'textarea',
-      '[contenteditable="true"][role="textbox"]',
-      '[contenteditable="true"]',
-      'div[role="textbox"]',
-      'input[type="text"]',
-    ];
-    const promptInput = await this.waitForAnyVisibleLocator(page, promptSelectors, 15000);
-    if (promptInput) {
-      const desc = await promptInput.evaluate((el: Element) =>
-        `${el.tagName}.${el.className} placeholder="${el.getAttribute('placeholder') || ''}"`
-      ).catch(() => 'unknown');
-      logger.info(`Found prompt input: ${desc}`);
-      await this.click(promptInput);
-      await new Promise(r => setTimeout(r, 300));
-      await promptInput.pressSequentially('Lorem ipsum dolor sit amet', { delay: 60 });
-    } else {
-      logger.warn('No prompt input found anywhere on page');
-      await this.saveDebugSnapshot(page, '03-no-prompt-input', requestLog);
+    // --- Step 1: Switch to the correct mode tab ---
+    // tabMode='advanced' → click Advanced (was labelled 'Custom' before Suno renamed it)
+    // tabMode='sounds'   → click Sounds tab for sound effects generation
+    const tabLabel = tabMode === 'sounds' ? 'Sounds' : 'Advanced';
+    logger.info(`Looking for ${tabLabel} mode tab`);
+    const tabSelectors = tabMode === 'sounds'
+      ? [
+          'button:has-text("Sounds")',
+          '[role="button"]:has-text("Sounds")',
+          'button:has-text("Sound")',
+        ]
+      : [
+          'button:has-text("Advanced")',
+          '[role="button"]:has-text("Advanced")',
+          'button:has-text("Custom")',        // fallback: old label
+          '[role="button"]:has-text("Custom")',
+        ];
+    let tabClicked = false;
+    for (const sel of tabSelectors) {
+      try {
+        const tab = page.locator(sel).first();
+        if (await tab.isVisible({ timeout: 2000 }).catch(() => false)) {
+          const tabText = await tab.evaluate((el: Element) => (el as HTMLElement).innerText?.trim()).catch(() => sel);
+          await this.click(tab);
+          await new Promise(r => setTimeout(r, 600)); // let panel animate in
+          logger.info(`Switched to ${tabLabel} mode via "${tabText}" tab`);
+          tabClicked = true;
+          break;
+        }
+      } catch {}
+    }
+    if (!tabClicked) {
+      logger.warn(`${tabLabel} tab not found — continuing in default (Auto) mode`);
+    }
+    await this.saveDebugSnapshot(page, '03-after-advanced-tab', requestLog);
+
+    // --- Step 2: Seed the form just enough to enable Create ---
+    // We only need a valid browser-side submission path to obtain a CAPTCHA token.
+    // For Advanced mode, avoid the brittle lyrics textarea entirely: use
+    // Instrumental mode plus clickable style chips. For Sounds mode, keep a
+    // simple prompt fill path because that tab requires a description.
+    let fillSucceeded = false;
+    try {
+      if (tabMode === 'sounds') {
+        logger.info('Looking for sound prompt input');
+        const promptSelectors = [
+          'textarea[placeholder*="sound" i]',
+          'textarea[placeholder*="describe" i]',
+          'textarea',
+        ];
+        const promptInput = await this.waitForAnyVisibleLocator(page, promptSelectors, 15000);
+        if (promptInput) {
+          const desc = await promptInput.evaluate((el: Element) =>
+            `${el.tagName}.${el.className} placeholder="${el.getAttribute('placeholder') || ''}"`
+          ).catch(() => 'unknown');
+          logger.info(`Found sound prompt input: ${desc}`);
+          await promptInput.click({ force: true });
+          await promptInput.fill('soft cinematic whoosh riser');
+          await new Promise(r => setTimeout(r, 500));
+          const promptValue = await promptInput.inputValue().catch(() => '');
+          fillSucceeded = promptValue.length > 0;
+          logger.info(`Sounds prompt seeded (length=${promptValue.length})`);
+        } else {
+          logger.warn('No sound prompt input found anywhere on page');
+          await this.saveDebugSnapshot(page, '04-no-prompt-input', requestLog);
+        }
+      } else {
+        logger.info('Advanced mode detected — using Instrumental + style chips instead of lyrics typing');
+
+        const instrumentalToggle = page.locator('button[aria-label*="instrumental" i]').first();
+        if (await instrumentalToggle.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await this.click(instrumentalToggle);
+          await new Promise(r => setTimeout(r, 500));
+          logger.info('Enabled Instrumental mode for CAPTCHA token acquisition');
+        } else {
+          logger.warn('Instrumental toggle not found — continuing with style chips only');
+        }
+
+        const styleButtons = page.locator('button[aria-label^="Add style:"]');
+        const styleCount = await styleButtons.count().catch(() => 0);
+        if (styleCount > 0) {
+          const clickedLabels: string[] = [];
+          const clickLimit = Math.min(styleCount, 3);
+          for (let index = 0; index < clickLimit; index++) {
+            const styleButton = styleButtons.nth(index);
+            if (!(await styleButton.isVisible().catch(() => false)))
+              continue;
+            const label = await styleButton.getAttribute('aria-label').catch(() => null);
+            await this.click(styleButton);
+            await new Promise(r => setTimeout(r, 300));
+            if (label)
+              clickedLabels.push(label.replace(/^Add style:\s*/i, ''));
+          }
+          fillSucceeded = clickedLabels.length > 0;
+          logger.info(`Clicked style suggestion chips: ${clickedLabels.join(', ') || 'none'}`);
+        } else {
+          logger.warn('No style suggestion chips found — Create button may stay disabled');
+        }
+      }
+    } catch (fillErr: any) {
+      logger.warn(
+        `Form seeding failed: ${fillErr.message?.substring(0, 120)}. ` +
+        'Continuing with the current browser state.'
+      );
     }
 
-    // --- Step 2: Find and click the Create / Generate button ---
+    // --- Step 3: Find and click the Create / Generate button ---
     logger.info('Looking for Create/Generate button');
     const buttonSelectors = [
       'button[aria-label="Create"]',
@@ -630,6 +1077,8 @@ class SunoApi {
     if (!button) {
       logger.error('Could not find any Create/Generate button');
       await this.saveDebugSnapshot(page, '04-no-create-button', requestLog);
+      this._browserContext = null;
+      this._browserPage = null;
       await browser.browser()?.close();
       throw new Error(
         'Could not find a Create/Generate button on the page. '
@@ -642,6 +1091,39 @@ class SunoApi {
     ).catch(() => 'unknown');
     logger.info(`Found button: ${buttonInfo}`);
 
+    // --- Wait for the Create button to become enabled ---
+    // Suno loads invisible Turnstile + hCaptcha challenges on page load. The Create
+    // button stays disabled until these challenges complete. Clicking a disabled
+    // button does nothing — the browser's JS ignores it and no generate POST fires.
+    //
+    // CRITICAL: Do NOT force-enable and click prematurely. Force-enabling the DOM
+    // button while React's internal state still has disabled=true means React's
+    // synthetic event system blocks the onClick handler. Clicking in this state
+    // corrupts Suno's form state, preventing subsequent natural clicks from working.
+    // Instead, wait patiently for the button to become enabled naturally.
+    const isDisabled = await button.evaluate((el: Element) => (el as HTMLButtonElement).disabled).catch(() => false);
+    if (isDisabled) {
+      logger.info('Create button is disabled — waiting for it to become enabled...');
+      const enableStart = Date.now();
+      // Use CAPTCHA UI timeout + buffer. Turnstile can take 2-3 minutes to complete.
+      const ENABLE_TIMEOUT = parseInt(process.env.SUNO_CAPTCHA_UI_TIMEOUT_MS || '180000', 10) + 60000;
+      while (Date.now() - enableStart < ENABLE_TIMEOUT) {
+        const stillDisabled = await button.evaluate((el: Element) => (el as HTMLButtonElement).disabled).catch(() => true);
+        if (!stillDisabled) {
+          logger.info(`Create button enabled after ${((Date.now() - enableStart) / 1000).toFixed(1)}s`);
+          break;
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      const finalDisabled = await button.evaluate((el: Element) => (el as HTMLButtonElement).disabled).catch(() => true);
+      if (finalDisabled) {
+        logger.warn('Create button still disabled after extended timeout — will try force-enable after CAPTCHA detection');
+        await this.saveDebugSnapshot(page, '04-button-still-disabled', requestLog);
+      }
+    } else {
+      logger.info('Create button is already enabled');
+    }
+
     // Set up route interception BEFORE clicking Create so we don't miss the generate call
     const controller = new AbortController();
     let rejectOuter: (err: any) => void = () => {};
@@ -653,11 +1135,20 @@ class SunoApi {
       rejectOuter = reject;
 
       // Intercept the generate API call to extract the captcha token.
-      // Match any generate endpoint: v2/, v2-web/, v3/, etc.
+      // Match any generate endpoint: v2/, v2-web/, v3/, sound-effects/, etc.
+      // Note: this also matches non-generation URLs like /api/generate/concurrent-status
+      // (a GET-only status endpoint), so we filter by method below.
       page.route('**/api/generate/**', async (route: any) => {
         try {
-          logger.info('Generate API call intercepted! Extracting token and closing browser');
           const request = route.request();
+
+          // Only intercept POST requests — GET endpoints like /concurrent-status are
+          // status-polling endpoints and must NOT be captured as the generation URL.
+          if (request.method() !== 'POST') {
+            return route.continue();
+          }
+
+          logger.info('Generate API call intercepted! Extracting token and closing browser');
           this.currentToken = request.headers().authorization?.split('Bearer ').pop();
           const postData = request.postDataJSON();
           // Capture the model the browser sent so we can mirror it in our API call
@@ -665,26 +1156,133 @@ class SunoApi {
             this.capturedBrowserModel = postData.mv;
             logger.info(`Browser model captured: ${postData.mv}`);
           }
-          route.abort();
-          controller.abort();
-          tokenCaptured = true; // signal the sequential flow to short-circuit
-          const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
-          if (this.keepBrowserOpen && !isHeadless) {
-            logger.info('[BROWSER_KEEP_OPEN] Browser staying open — close the window manually when done.');
-            page.waitForEvent('close', { timeout: 0 }).finally(() => browser.browser()?.close()).catch(() => {});
-          } else {
-            browser.browser()?.close();
+          // Capture the actual generate endpoint path (e.g. /api/generate/v3-web/) so we
+          // don't rely on a hardcoded fallback that may drift as Suno evolves their API.
+          // Store in the appropriate property based on which tab mode was selected.
+          // Skip non-generation paths like /concurrent-status, /status, etc.
+          try {
+            const urlObj = new URL(request.url());
+            const pathname = urlObj.pathname;
+            if (/\/(concurrent-status|status|queue)\b/.test(pathname)) {
+              logger.info(`Skipping non-generation endpoint: ${pathname}`);
+              return route.abort();
+            }
+            if (tabMode === 'sounds') {
+              this.capturedSoundsEndpoint = pathname;
+              logger.info(`Browser sounds endpoint captured: ${pathname}`);
+            } else {
+              this.capturedBrowserEndpoint = pathname;
+              logger.info(`Browser generate endpoint captured: ${pathname}`);
+            }
+          } catch {
+            logger.warn(`Could not parse generate request URL: ${request.url()}`);
           }
-          resolve(postData?.token || null);
+          const extractedToken = postData?.token || null;
+          logger.info(`Intercepted POST data keys: ${JSON.stringify(Object.keys(postData || {}))}`);
+          logger.info(`Intercepted POST data FULL: ${JSON.stringify(postData, null, 2)}`);
+          route.abort();
+
+          if (extractedToken) {
+            // Valid CAPTCHA token found — resolve and close
+            controller.abort();
+            tokenCaptured = true;
+            const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+            if (this.keepBrowserOpen && !isHeadless) {
+              logger.info('[BROWSER_KEEP_OPEN] Browser staying open for reuse by next request.');
+              this._browserContext = browser;
+              this._browserPage = page;
+              // If user manually closes the window, clean up references
+              page.once('close', () => {
+                this._browserContext = null;
+                this._browserPage = null;
+                browser.browser()?.close().catch(() => {});
+              });
+            } else {
+              this._browserContext = null;
+              this._browserPage = null;
+              browser.browser()?.close();
+            }
+            resolve(extractedToken);
+          } else {
+            // No CAPTCHA token in the intercepted request.
+            const forceEnv = yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false });
+            if (forceEnv && this.capturedTurnstileSitekey) {
+               logger.info('No token in request, but BROWSER_FORCE_CAPTCHA is true. Forcing Turnstile solve...');
+               try {
+                 controller.abort();
+                 tokenCaptured = true;
+                 const result = await this.solver.cloudflareTurnstile({
+                   pageurl: 'https://suno.com/create',
+                   sitekey: this.capturedTurnstileSitekey,
+                 });
+                 logger.info(`Forced Turnstile CAPTCHA solved by 2Captcha (token: ${result.data.slice(0, 20)}…)`);
+                 
+                 const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+                 if (this.keepBrowserOpen && !isHeadless) {
+                   logger.info('[BROWSER_KEEP_OPEN] Browser staying open for reuse by next request.');
+                   this._browserContext = browser;
+                   this._browserPage = page;
+                   page.once('close', () => {
+                     this._browserContext = null;
+                     this._browserPage = null;
+                     browser.browser()?.close().catch(() => {});
+                   });
+                 } else {
+                   this._browserContext = null;
+                   this._browserPage = null;
+                   browser.browser()?.close();
+                 }
+                 resolve(result.data);
+               } catch (e: any) {
+                 logger.error(`Forced Turnstile solving failed: ${e.message}`);
+                 // Let the fallback mechanics try to find a CAPTCHA frame
+                 logger.warn('No CAPTCHA token in intercepted request — continuing CAPTCHA detection flow');
+                 tokenCaptured = false;
+               }
+            } else if (!forceEnv) {
+               logger.info('No CAPTCHA token in request and force is disabled. Trusting session without CAPTCHA.');
+               controller.abort();
+               tokenCaptured = true;
+               const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+               if (this.keepBrowserOpen && !isHeadless) {
+                 this._browserContext = browser;
+                 this._browserPage = page;
+                 page.once('close', () => {
+                   this._browserContext = null;
+                   this._browserPage = null;
+                   browser.browser()?.close().catch(() => {});
+                 });
+               } else {
+                 this._browserContext = null;
+                 this._browserPage = null;
+                 browser.browser()?.close();
+               }
+               resolve(null);
+            } else {
+              // Don't short-circuit; let the CAPTCHA detection flow continue so we can try
+              // to wait for an iframe and solve natively.
+              logger.warn('No CAPTCHA token in intercepted request — continuing CAPTCHA detection flow');
+            }
+          }
         } catch (err) {
           reject(err);
         }
       });
     });
 
-    // Click the button to trigger generation (and hopefully a CAPTCHA)
-    logger.info('Clicking Create button');
-    await this.click(button);
+    // Click the button to trigger generation (and hopefully a CAPTCHA).
+    // Only click if the button is currently enabled — clicking a force-enabled
+    // button corrupts Suno's form state and prevents subsequent clicks from working.
+    const buttonIsEnabled = !(await button.evaluate(
+      (el: Element) => (el as HTMLButtonElement).disabled
+    ).catch(() => true));
+
+    if (buttonIsEnabled) {
+      logger.info('Clicking Create button');
+      await this.click(button);
+    } else {
+      logger.warn('Create button is still disabled — skipping click, will try force-enable after CAPTCHA detection');
+    }
 
     // Wait up to 3s — exit immediately if the token was already captured
     await Promise.race([
@@ -700,33 +1298,36 @@ class SunoApi {
     await this.saveDebugSnapshot(page, '05-after-create-click', requestLog);
 
     // --- Step 3: Detect what CAPTCHA appeared ---
-    logger.info('Waiting for CAPTCHA challenge to appear...');
-    let captchaType = await this.waitForCaptchaFrame(page, 15000);
+    let captchaType: string | null = null;
+    if (buttonIsEnabled) {
+      logger.info('Waiting for CAPTCHA challenge to appear...');
+      captchaType = await this.waitForCaptchaFrame(page, 15000);
 
-    // Re-check after CAPTCHA wait in case token appeared without a CAPTCHA challenge
-    if (!captchaType && tokenCaptured) {
-      logger.info('Token captured during CAPTCHA wait — no CAPTCHA challenge needed');
-      return tokenPromise;
-    }
-
-    if (!captchaType) {
-      // Try clicking the button again — sometimes the first click is swallowed
-      logger.warn('No CAPTCHA detected after first click. Retrying...');
-      await this.click(button);
-
-      // Wait up to 5s — exit immediately if token captured on retry click
-      await Promise.race([
-        tokenPromise.catch(() => {}),
-        new Promise(r => setTimeout(r, 5000)),
-      ]);
-      if (tokenCaptured) {
-        logger.info('Token captured after retry click — skipping CAPTCHA detection');
-        await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
+      // Re-check after CAPTCHA wait in case token appeared without a CAPTCHA challenge
+      if (!captchaType && tokenCaptured) {
+        logger.info('Token captured during CAPTCHA wait — no CAPTCHA challenge needed');
         return tokenPromise;
       }
 
-      await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
-      captchaType = await this.waitForCaptchaFrame(page, 20000);
+      if (!captchaType) {
+        // Try clicking the button again — sometimes the first click is swallowed
+        logger.warn('No CAPTCHA detected after first click. Retrying...');
+        await this.click(button);
+
+        // Wait up to 5s — exit immediately if token captured on retry click
+        await Promise.race([
+          tokenPromise.catch(() => {}),
+          new Promise(r => setTimeout(r, 5000)),
+        ]);
+        if (tokenCaptured) {
+          logger.info('Token captured after retry click — skipping CAPTCHA detection');
+          await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
+          return tokenPromise;
+        }
+
+        await this.saveDebugSnapshot(page, '06-after-second-click', requestLog);
+        captchaType = await this.waitForCaptchaFrame(page, 20000);
+      }
     }
 
     if (!captchaType) {
@@ -735,14 +1336,161 @@ class SunoApi {
         return tokenPromise;
       }
 
-      // Truly no CAPTCHA and no generation
-      await this.saveDebugSnapshot(page, '07-no-captcha-final', requestLog);
-      await browser.browser()?.close();
-      throw new Error(
-        'No CAPTCHA appeared and generation did not proceed. '
-        + 'The Suno UI may have changed significantly. '
-        + 'Check the debug/ folder for HTML, screenshots, interactive elements, and request logs.'
-      );
+      // No visible CAPTCHA frame — the Turnstile/hCaptcha challenges are invisible.
+      // The Create button may still be disabled if challenges haven't completed yet.
+      // Wait for the button to become enabled, then click it to trigger the generate POST.
+      logger.info('No CAPTCHA frame detected — waiting for Create button to become enabled');
+
+      const retryEnableStart = Date.now();
+      const RETRY_ENABLE_TIMEOUT = parseInt(process.env.SUNO_CAPTCHA_UI_TIMEOUT_MS || '180000', 10);
+      let buttonEnabled = false;
+      while (Date.now() - retryEnableStart < RETRY_ENABLE_TIMEOUT) {
+        const disabled = await button.evaluate((el: Element) => (el as HTMLButtonElement).disabled).catch(() => true);
+        if (!disabled) {
+          buttonEnabled = true;
+          logger.info(`Create button became enabled after ${((Date.now() - retryEnableStart) / 1000).toFixed(1)}s`);
+          break;
+        }
+        if (tokenCaptured) return tokenPromise;
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      if (buttonEnabled) {
+        // Click the now-enabled Create button — this should be the first real click
+        // if the button wasn't enabled during the initial wait phase.
+        logger.info('Clicking Create button (after natural enable)');
+        await this.click(button);
+
+        // Wait for the route intercept to capture the token
+        await Promise.race([
+          tokenPromise.catch(() => {}),
+          new Promise(r => setTimeout(r, 15000)),
+        ]);
+        if (tokenCaptured) {
+          logger.info('Token captured after enabled-button click');
+          return tokenPromise;
+        }
+
+        // Sometimes clicking triggers hCaptcha — check for it
+        const lateCapType = await this.waitForCaptchaFrame(page, 10000);
+        if (lateCapType) {
+          logger.info(`Late CAPTCHA detected after enabled click: ${lateCapType}`);
+          captchaType = lateCapType;
+          // Fall through to the CAPTCHA solving section below
+        }
+      }
+
+      // If we still have a CAPTCHA type from late detection, fall through to solve it
+      if (captchaType) {
+        // Will be handled by the CAPTCHA solving section below
+        logger.info(`Proceeding to solve late-detected CAPTCHA: ${captchaType}`);
+      } else {
+        // --- Last resort: force-enable the button and try clicking ---
+        if (!buttonEnabled) {
+          logger.warn('Button never became enabled — force-enabling as last resort');
+          await button.evaluate((el: Element) => {
+            const btn = el as HTMLButtonElement;
+            btn.disabled = false;
+            btn.removeAttribute('disabled');
+            // Also patch React fiber props so React's synthetic events don't block onClick
+            const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            if (fiberKey) {
+              const fiber = (el as any)[fiberKey];
+              if (fiber?.memoizedProps && 'disabled' in fiber.memoizedProps)
+                fiber.memoizedProps.disabled = false;
+              if (fiber?.pendingProps && 'disabled' in fiber.pendingProps)
+                fiber.pendingProps.disabled = false;
+            }
+          });
+          await new Promise(r => setTimeout(r, 300));
+          logger.info('Clicking force-enabled Create button (last resort)');
+          await this.click(button);
+
+          await Promise.race([
+            tokenPromise.catch(() => {}),
+            new Promise(r => setTimeout(r, 15000)),
+          ]);
+          if (tokenCaptured) {
+            logger.info('Token captured after force-enable click');
+            return tokenPromise;
+          }
+        }
+
+        // --- Fallback: try to extract Turnstile token directly from page ---
+        logger.info('Attempting to extract Turnstile token directly from page');
+        const directToken = await page.evaluate(() => {
+          // Check for Cloudflare Turnstile response in hidden input
+          const turnstileInput = document.querySelector<HTMLInputElement>(
+            '[name="cf-turnstile-response"], input[name*="turnstile"]'
+          );
+          if (turnstileInput?.value) return turnstileInput.value;
+
+          // Try Turnstile API
+          try {
+            const w = window as any;
+            if (w.turnstile?.getResponse) {
+              const resp = w.turnstile.getResponse();
+              if (resp) return resp;
+            }
+          } catch { /* ignore */ }
+
+          // Check Turnstile iframes for response
+          const iframes = document.querySelectorAll('iframe[src*="turnstile"]');
+          for (const iframe of iframes) {
+            const name = iframe.getAttribute('name') || '';
+            const match = name.match(/cf-chl-widget-([a-z0-9]+)/i);
+            if (match) {
+              try {
+                const w = window as any;
+                if (w.turnstile?.getResponse) {
+                  const resp = w.turnstile.getResponse(match[1]);
+                  if (resp) return resp;
+                }
+              } catch { /* ignore */ }
+            }
+          }
+
+          return null;
+        }).catch(() => null);
+
+        if (directToken) {
+          logger.info(`Extracted Turnstile token directly (length=${directToken.length})`);
+          resolveOuter(directToken);
+          // Store browser for reuse
+          const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+          if (this.keepBrowserOpen && !isHeadless) {
+            this._browserContext = browser;
+            this._browserPage = page;
+            page.once('close', () => {
+              this._browserContext = null;
+              this._browserPage = null;
+              browser.browser()?.close().catch(() => {});
+            });
+          }
+          return tokenPromise;
+        }
+
+        // Truly no token — save debug info and give up
+        logger.warn('All CAPTCHA token extraction methods failed');
+        await this.saveDebugSnapshot(page, '07-no-captcha-final', requestLog);
+        const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
+        if (this.keepBrowserOpen && !isHeadless) {
+          logger.info('[BROWSER_KEEP_OPEN] Browser staying open for reuse by next request.');
+          this._browserContext = browser;
+          this._browserPage = page;
+          page.once('close', () => {
+            this._browserContext = null;
+            this._browserPage = null;
+            browser.browser()?.close().catch(() => {});
+          });
+        } else {
+          this._browserContext = null;
+          this._browserPage = null;
+          await browser.browser()?.close();
+        }
+        resolveOuter(null);
+        return tokenPromise;
+      }
     }
 
     logger.info(`Detected CAPTCHA type: ${captchaType}`);
@@ -814,15 +1562,34 @@ class SunoApi {
               for (const data of captcha.data) {
                 logger.info(data);
                 await this.click(challenge, { x: +data.x, y: +data.y });
+                await sleep(500);
               }
-              wait = true; // Wait for new challenge images after submit
+              // Don't wait for images here yet, we will check status after clicking submit
             }
-            this.click(frame.locator('.button-submit')).catch(e => {
+
+            await sleep(500);
+            try {
+              await this.click(frame.locator('.button-submit'));
+            } catch (e: any) {
               if (e.message.includes('viewport'))
-                this.click(button);
+                await this.click(frame.locator('.button-submit'));
               else
                 throw e;
-            });
+            }
+
+            // Wait a moment to let the UI update (either show error, or start loading new images)
+            await sleep(2000);
+
+            // Check if it showed an error instead of loading new images
+            const tryAgainVisible = await frame.getByText('try again', { exact: false }).isVisible().catch(() => false);
+            if (tryAgainVisible) {
+              logger.info('hCaptcha reported "Please try again". Requesting new solution...');
+              if (captcha?.id) this.solver.badReport(captcha.id).catch(() => null);
+              wait = false;
+              continue;
+            }
+
+            wait = true; // Wait for new challenge images after successful submit click
           }
         } catch (e: any) {
           if (
@@ -839,7 +1606,7 @@ class SunoApi {
 
     } else if (captchaType === 'turnstile') {
       // --- Solve Cloudflare Turnstile via 2Captcha ---
-      logger.info('Starting Turnstile solving via 2Captcha');
+      logger.info('Turnstile detected — solving via 2Captcha');
 
       // Extract the sitekey from the DOM or from the Turnstile iframe URL
       let sitekey: string | null = await page.evaluate(() => {
@@ -851,7 +1618,6 @@ class SunoApi {
         for (const frame of page.frames()) {
           const url = frame.url();
           if (url.includes('challenges.cloudflare.com') || url.includes('turnstile')) {
-            // Sitekey appears as a path segment, typically prefixed with 0x
             const match = url.match(/\/(0x[0-9a-zA-Z_-]{10,})\//i) || url.match(/\/([0-9a-zA-Z_-]{20,})\//);
             if (match) { sitekey = match[1]; break; }
           }
@@ -860,6 +1626,8 @@ class SunoApi {
 
       if (!sitekey) {
         await this.saveDebugSnapshot(page, '08-turnstile-no-sitekey', requestLog);
+        this._browserContext = null;
+        this._browserPage = null;
         await browser.browser()?.close();
         throw new Error('Could not extract Turnstile sitekey from the page. Check debug/ folder for details.');
       }
@@ -884,9 +1652,17 @@ class SunoApi {
           controller.abort();
           const isHeadless = yn(process.env.BROWSER_HEADLESS, { default: true });
           if (this.keepBrowserOpen && !isHeadless) {
-            logger.info('[BROWSER_KEEP_OPEN] Browser staying open — close the window manually when done.');
-            page.waitForEvent('close', { timeout: 0 }).finally(() => browser.browser()?.close()).catch(() => {});
+            logger.info('[BROWSER_KEEP_OPEN] Browser staying open for reuse by next request.');
+            this._browserContext = browser;
+            this._browserPage = page;
+            page.once('close', () => {
+              this._browserContext = null;
+              this._browserPage = null;
+              browser.browser()?.close().catch(() => {});
+            });
           } else {
+            this._browserContext = null;
+            this._browserPage = null;
             browser.browser()?.close();
           }
           resolveOuter(result.data);
@@ -905,6 +1681,8 @@ class SunoApi {
 
     } else {
       await this.saveDebugSnapshot(page, '08-unsupported-captcha', requestLog);
+      this._browserContext = null;
+      this._browserPage = null;
       await browser.browser()?.close();
       throw new Error(
         `Detected CAPTCHA type "${captchaType}" which is not currently supported. `
@@ -914,6 +1692,8 @@ class SunoApi {
 
     // Wire captcha solver errors into the token promise
     captchaSolverPromise.catch(e => {
+      this._browserContext = null;
+      this._browserPage = null;
       browser.browser()?.close();
       rejectOuter(e);
     });
@@ -996,6 +1776,7 @@ class SunoApi {
    * @param make_instrumental Indicates if the generated audio should be instrumental.
    * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
    * @param negative_tags Negative tags that should not be included in the generated audio.
+   * @param advanced Advanced options: vocal_gender, weirdness, style_influence, persona_id.
    * @returns A promise that resolves to an array of AudioInfo objects representing the generated audios.
    */
   public async custom_generate(
@@ -1005,7 +1786,8 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    advanced?: AdvancedOptions
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.generateSongs(
@@ -1016,7 +1798,11 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined, // task
+      undefined, // continue_clip_id
+      undefined, // continue_at
+      advanced
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -1024,6 +1810,152 @@ class SunoApi {
     );
     logger.info('Cost time: ' + costTime);
     return audios;
+  }
+
+  /**
+   * Generates sound effects (Sounds tab) based on a text description.
+   *
+   * @param prompt Description of the sound you want (e.g. "thunderstorm with heavy rain").
+   * @param make_instrumental Currently always true for sounds — no vocals.
+   * @param model Optional model to use.
+   * @param wait_audio Whether to poll until audio is complete before returning.
+   * @returns A promise that resolves to an array of AudioInfo objects.
+   */
+  public async generate_sounds(
+    prompt: string,
+    make_instrumental: boolean = true,
+    model?: string,
+    wait_audio: boolean = false,
+  ): Promise<AudioInfo[]> {
+    const reqId = ++this.requestCounter;
+    const release = await this.requestSemaphore.acquire();
+    logger.info(
+      `[req-${reqId}] Acquired slot for sounds (active: ${this.requestSemaphore.activeCount}, waiting: ${this.requestSemaphore.waitingCount})`
+    );
+
+    try {
+      await this.keepAlive();
+
+      const payload: any = {
+        gpt_description_prompt: prompt,
+        prompt: '',  // Required by Suno API — sounds use gpt_description_prompt for the actual text
+        make_instrumental: make_instrumental,
+        mv: model || DEFAULT_MODEL,
+        generation_type: 'TEXT',
+      };
+
+      // Solve CAPTCHA using the Sounds tab so we capture the correct endpoint.
+      // Only include token in the payload when it's non-null — the browser doesn't
+      // send a token field when no CAPTCHA was shown, and sending token:null can
+      // cause Suno to reject the request with 422.
+      const captchaToken = await this.getCaptcha(
+        yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }),
+        'sounds'
+      );
+      if (captchaToken) {
+        payload.token = captchaToken;
+      }
+
+      await this.keepAlive();
+
+      const resolvedModel = model || this.capturedBrowserModel || DEFAULT_MODEL;
+      payload.mv = resolvedModel;
+
+      // The Sounds tab uses the same /api/generate/v2-web/ endpoint as Advanced mode.
+      // Fall back to the advanced endpoint captured from the browser, then to the sounds-specific
+      // endpoint, and finally to a hardcoded fallback.
+      const resolvedEndpoint = this.capturedSoundsEndpoint
+        || this.capturedBrowserEndpoint
+        || '/api/generate/v2-web/';
+
+      const tokenPreview = captchaToken
+        ? `✅ ${captchaToken.slice(0, 12)}…${captchaToken.slice(-6)} (len:${captchaToken.length})`
+        : '❌ null (no CAPTCHA token — sending without token)';
+
+      const sep = '─'.repeat(55);
+      logger.info(
+        `\n${sep}\n` +
+        `🔊  SOUNDS REQUEST  [req-${reqId}]\n` +
+        `${sep}\n` +
+        `🤖  Mode              : 🔊 Sounds (sound effects)\n` +
+        `🧠  Model / Version   : ${resolvedModel}\n` +
+        `📝  Prompt            : "${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"\n` +
+        `⏳  Wait for audio    : ${wait_audio ? '✅ Yes' : '❌ No'}\n` +
+        `🌐  Sounds endpoint   : ${resolvedEndpoint}${this.capturedSoundsEndpoint ? ' (from browser)' : ' (fallback)'}\n` +
+        `🛡️  CAPTCHA token     : ${tokenPreview}\n` +
+        `📦  Payload keys      : ${JSON.stringify(Object.keys(payload))}\n` +
+        `${sep}`
+      );
+
+      const doGenerate = () => this.client.post(
+        `${SunoApi.BASE_URL}${resolvedEndpoint}`,
+        payload,
+        { timeout: 10000 }
+      );
+
+      const response = await doGenerate().catch(async (err: any) => {
+        const status = err?.response?.status ?? err?.status;
+        const detail: string = (err?.response?.data?.detail ?? '').toLowerCase();
+        const respData = err?.response?.data;
+        logger.warn(`[req-${reqId}] Sounds generate failed: status=${status}, detail="${respData?.detail}", full response: ${JSON.stringify(respData)}`);
+
+        if (status === 422 || detail.includes('token')) {
+          logger.warn(`[req-${reqId}] Sounds got ${status} — force-solving CAPTCHA and retrying`);
+          const retryToken = await this.getCaptcha(true, 'sounds');
+          if (retryToken) {
+            payload.token = retryToken;
+          } else {
+            // No CAPTCHA token available even after force-solve.
+            // Try sending without a token field — may work if Suno session is valid.
+            logger.warn(`[req-${reqId}] Force-solve returned null — retrying without token field`);
+            delete payload.token;
+          }
+          return doGenerate();
+        }
+        throw err;
+      });
+
+      if (response.status !== 200) {
+        throw new Error('Error response:' + response.statusText);
+      }
+
+      const songIds = response.data.clips.map((audio: any) => audio.id);
+      if (wait_audio) {
+        const startTime = Date.now();
+        let lastResponse: AudioInfo[] = [];
+        await sleep(5, 5);
+        while (Date.now() - startTime < 100000) {
+          const resp = await this.get(songIds);
+          const allDone = resp.every(a => a.status === 'streaming' || a.status === 'complete');
+          const allError = resp.every(a => a.status === 'error');
+          if (allDone || allError) return resp;
+          lastResponse = resp;
+          await sleep(3, 6);
+          await this.keepAlive(true);
+        }
+        return lastResponse;
+      } else {
+        return response.data.clips.map((audio: any) => ({
+          id: audio.id,
+          title: audio.title,
+          image_url: audio.image_url,
+          lyric: audio.metadata?.prompt,
+          audio_url: audio.audio_url,
+          video_url: audio.video_url,
+          created_at: audio.created_at,
+          model_name: audio.model_name,
+          status: audio.status,
+          gpt_description_prompt: audio.metadata?.gpt_description_prompt,
+          prompt: audio.metadata?.prompt,
+          type: audio.metadata?.type,
+          tags: audio.metadata?.tags,
+          duration: audio.metadata?.duration,
+        }));
+      }
+    } finally {
+      logger.info(`[req-${reqId}] Released slot`);
+      release();
+    }
   }
 
   /**
@@ -1051,7 +1983,8 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    advanced?: AdvancedOptions
   ): Promise<AudioInfo[]> {
     const reqId = ++this.requestCounter;
     const release = await this.requestSemaphore.acquire();
@@ -1079,7 +2012,60 @@ class SunoApi {
       payload.gpt_description_prompt = prompt;
     }
 
-    payload.token = await this.getCaptcha(yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }));
+    // --- Advanced options (More Options panel) ---
+    if (advanced) {
+      // Build metadata.control_sliders for numeric knobs (weirdness, style influence)
+      const controlSliders: Record<string, number> = {};
+      if (advanced.weirdness != null) {
+        // UI shows 0-100 but Suno expects 0-1 float (weirdness_constraint)
+        const w = advanced.weirdness > 1 ? advanced.weirdness / 100 : advanced.weirdness;
+        controlSliders.weirdness_constraint = w;
+      }
+      if (advanced.style_influence != null) {
+        // UI shows 0-100 but Suno expects 0-1 float (style_weight)
+        const s = advanced.style_influence > 1 ? advanced.style_influence / 100 : advanced.style_influence;
+        controlSliders.style_weight = s;
+      }
+
+      // Merge into payload.metadata
+      if (!payload.metadata) payload.metadata = {};
+      if (Object.keys(controlSliders).length > 0) {
+        payload.metadata.control_sliders = controlSliders;
+      }
+      if (advanced.vocal_gender) {
+        // Suno relies on tags/prompts for vocal gender
+        if (isCustom && typeof payload.tags === 'string') {
+          if (!payload.tags.toLowerCase().includes(advanced.vocal_gender)) {
+            payload.tags = payload.tags ? `${payload.tags}, ${advanced.vocal_gender} vocals` : `${advanced.vocal_gender} vocals`;
+          }
+        } else if (!isCustom && typeof payload.gpt_description_prompt === 'string') {
+          if (!payload.gpt_description_prompt.toLowerCase().includes(advanced.vocal_gender)) {
+            payload.gpt_description_prompt += `, ${advanced.vocal_gender} vocals`;
+          }
+        }
+        payload.metadata.vocal_gender = advanced.vocal_gender;
+      }
+
+      // Persona is a top-level field
+      if (advanced.persona_id) {
+        payload.persona_id = advanced.persona_id;
+      }
+    }
+
+    const forceCaptcha = yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false });
+    const captchaToken = await this.getCaptcha(forceCaptcha);
+    if (captchaToken) {
+      payload.token = captchaToken;
+    } else if (forceCaptcha) {
+      // CAPTCHA solving was forced but the browser flow failed to obtain a token.
+      // Sending without a token will 422, and retrying would open a second browser
+      // that fails the same way. Fail fast instead.
+      throw new Error(
+        'CAPTCHA token could not be obtained (browser flow failed). '
+        + 'The Create button may have stayed disabled because textarea filling failed. '
+        + 'Check debug/ folder for screenshots and HTML snapshots.'
+      );
+    }
 
     // Refresh JWT in case the captcha session took long enough to stale it
     await this.keepAlive();
@@ -1088,9 +2074,17 @@ class SunoApi {
     const resolvedModel = model || this.capturedBrowserModel || DEFAULT_MODEL;
     payload.mv = resolvedModel;
 
-    const tokenPreview = payload.token
-      ? `✅ ${payload.token.slice(0, 12)}…${payload.token.slice(-6)} (len:${payload.token.length})`
-      : '❌ null (no CAPTCHA token)';
+    // Use the endpoint URL captured from the browser (mirrors whatever Suno's frontend uses).
+    // The browser always captures the Advanced/Custom endpoint (e.g. /api/generate/v2-web/).
+    // For Simple/Auto mode (isCustom=false), Suno uses a separate endpoint without the -web suffix.
+    const capturedOrFallback = this.capturedBrowserEndpoint || '/api/generate/v2-web/';
+    const resolvedEndpoint = isCustom
+      ? capturedOrFallback
+      : capturedOrFallback.replace('-web/', '/');
+
+    const tokenPreview = captchaToken
+      ? `✅ ${captchaToken.slice(0, 12)}…${captchaToken.slice(-6)} (len:${captchaToken.length})`
+      : '❌ null (no CAPTCHA token — sending without token)';
 
     const sep = '─'.repeat(55);
     logger.info(
@@ -1098,7 +2092,7 @@ class SunoApi {
       `🎵  GENERATE REQUEST  [req-${reqId}]\n` +
       `${sep}\n` +
       `🆔  Request ID        : ${reqId}\n` +
-      `🤖  Mode              : ${isCustom ? '🎨 Custom (manual style)' : '✨ Auto (AI description)'}\n` +
+      `🤖  Mode              : ${isCustom ? '🎨 Advanced (manual style)' : '✨ Auto (AI description)'}\n` +
       `🧠  Model / Version   : ${resolvedModel}${this.capturedBrowserModel && !model ? ' (from browser)' : ''}\n` +
       `📝  Prompt            : ${prompt ? `"${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"` : '(none)'}\n` +
       `🎼  Title             : ${title || '(not set)'}\n` +
@@ -1109,12 +2103,17 @@ class SunoApi {
       `🔧  Task              : ${task || 'generate (default)'}\n` +
       `🔗  Continue clip ID  : ${continue_clip_id || '(none)'}\n` +
       `⏱️  Continue at       : ${continue_at != null ? `${continue_at}s` : '(none)'}\n` +
+      `�  Vocal Gender      : ${advanced?.vocal_gender || '(auto)'}\n` +
+      `🌀  Weirdness         : ${advanced?.weirdness != null ? advanced.weirdness : '(default)'}\n` +
+      `🎨  Style Influence   : ${advanced?.style_influence != null ? advanced.style_influence : '(default)'}\n` +
+      `👤  Persona ID        : ${advanced?.persona_id || '(none)'}\n` +
+      `�🌐  Generate endpoint  : ${resolvedEndpoint}${this.capturedBrowserEndpoint ? ' (from browser)' : ' (fallback)'}\n` +
       `🛡️  CAPTCHA token     : ${tokenPreview}\n` +
       `${sep}`
     );
 
     const doGenerate = () => this.client.post(
-      `${SunoApi.BASE_URL}/api/generate/v2-web/`,
+      `${SunoApi.BASE_URL}${resolvedEndpoint}`,
       payload,
       { timeout: 10000 }
     );
@@ -1123,11 +2122,21 @@ class SunoApi {
     const response = await doGenerate().catch(async (err: any) => {
       const status = err?.response?.status ?? err?.status;
       const detail: string = (err?.response?.data?.detail ?? '').toLowerCase();
+      const respData = err?.response?.data;
+      logger.warn(`[req-${reqId}] Generate failed: status=${status}, detail="${respData?.detail}", full: ${JSON.stringify(respData)}`);
       if (status === 422 || detail.includes('token')) {
-        logger.warn(`[req-${reqId}] Generate got ${status} ("${err?.response?.data?.detail}") — force-solving CAPTCHA and retrying`);
-        payload.token = await this.getCaptcha(true);
-        if (!payload.token) throw new Error('Force-solve CAPTCHA returned null — cannot proceed.');
-        return doGenerate();
+        logger.warn(`[req-${reqId}] Generate got ${status} ("${respData?.detail}") — force-solving CAPTCHA and retrying`);
+        const retryToken = await this.getCaptcha(true);
+        if (retryToken) {
+          payload.token = retryToken;
+          return doGenerate();
+        }
+        // Force-solve returned null — no point retrying without a token (we'd get 422 again)
+        throw new Error(
+          `CAPTCHA token required but could not be obtained. `
+          + `Suno returned ${status}: "${respData?.detail}". `
+          + `Ensure TWOCAPTCHA_KEY is set and 2Captcha has balance. Check debug/ folder for details.`
+        );
       }
       throw err;
     });

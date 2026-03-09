@@ -162,6 +162,27 @@
                     "type": "boolean",
                     "description": "Whether to wait for music generation, default is false, directly return audio task information; set to true, will wait for up to 100s until the audio is generated.",
                     "example": "false"
+                  },
+                  "vocal_gender": {
+                    "type": "string",
+                    "enum": ["male", "female"],
+                    "description": "Desired vocal gender for the generated audio.",
+                    "example": "female"
+                  },
+                  "weirdness": {
+                    "type": "number",
+                    "description": "Weirdness level (0-100). Higher values produce more experimental output. Default is 50 on Suno UI. Values > 1 are auto-converted to 0.0-1.0 scale.",
+                    "example": 50
+                  },
+                  "style_influence": {
+                    "type": "number",
+                    "description": "Style influence level (0-100). Higher values make the style tags more influential. Default is 50 on Suno UI. Values > 1 are auto-converted to 0.0-1.0 scale.",
+                    "example": 50
+                  },
+                  "persona_id": {
+                    "type": "string",
+                    "description": "UUID of a Suno persona to use for generation.",
+                    "example": ""
                   }
                 }
               }
