@@ -355,6 +355,33 @@ class SunoApi {
   }
 
   /**
+   * Clicks a locator more defensively for CAPTCHA UIs where Playwright can report
+   * viewport issues even after scrolling the element into view.
+   */
+  private async clickLocatorRobust(locator: Locator): Promise<void> {
+    const target = locator.first();
+    await target.waitFor({ state: 'visible', timeout: 15000 });
+    await target.scrollIntoViewIfNeeded().catch(() => undefined);
+
+    try {
+      await target.click({ force: true });
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('viewport'))
+        throw error;
+    }
+
+    const handle = await target.elementHandle();
+    if (!handle)
+      throw new Error('Unable to resolve captcha button element handle');
+
+    await handle.evaluate((element) => {
+      (element as HTMLElement).click();
+    });
+  }
+
+  /**
    * Fill a React controlled input/textarea reliably.
    *
    * The core problem: React installs an instance-level `value` property
@@ -1647,29 +1674,29 @@ class SunoApi {
               for (const data of captcha.data) {
                 logger.info(data);
                 await this.click(challenge, { x: +data.x, y: +data.y });
-                await sleep(500);
+                await sleep(0.5);
               }
               // Don't wait for images here yet, we will check status after clicking submit
             }
 
-            await sleep(500);
-            try {
-              await this.click(frame.locator('.button-submit'));
-            } catch (e: any) {
-              if (e.message.includes('viewport'))
-                await this.click(frame.locator('.button-submit'));
-              else
-                throw e;
-            }
+            await sleep(0.5);
+            await this.clickLocatorRobust(frame.locator('.button-submit'));
 
             // Wait a moment to let the UI update (either show error, or start loading new images)
-            await sleep(2000);
+            await sleep(2);
 
             // Check if it showed an error instead of loading new images
             const tryAgainVisible = await frame.getByText('try again', { exact: false }).isVisible().catch(() => false);
             if (tryAgainVisible) {
               logger.info('hCaptcha reported "Please try again". Requesting new solution...');
               if (captcha?.id) this.solver.badReport(captcha.id).catch(() => null);
+              
+              // Wait for the "Please try again" message to disappear
+              await frame.getByText('try again', { exact: false }).waitFor({ state: 'hidden', timeout: 10000 }).catch(() => null);
+              
+              // Give extra time for the new challenge images to fully render
+              await sleep(2);
+              
               wait = false;
               continue;
             }
