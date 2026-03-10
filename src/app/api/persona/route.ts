@@ -31,11 +31,22 @@ export async function GET(req: NextRequest) {
           ...corsHeaders
         }
       });
-    } catch (error) {
+    } catch (error: unknown) {
       console.error('Error fetching persona:', error);
 
-      return new NextResponse(JSON.stringify({ error: 'Internal server error' }), {
-        status: 500,
+      const maybeResponse = typeof error === 'object' && error !== null && 'response' in error
+        ? (error as { response?: { status?: number; data?: unknown } }).response
+        : undefined;
+      const status = maybeResponse?.status && maybeResponse.status >= 400 && maybeResponse.status < 600
+        ? maybeResponse.status
+        : 500;
+      const message = error instanceof Error ? error.message : 'Internal server error';
+
+      return new NextResponse(JSON.stringify({
+        error: message,
+        details: maybeResponse?.data ?? null
+      }), {
+        status,
         headers: {
           'Content-Type': 'application/json',
           ...corsHeaders

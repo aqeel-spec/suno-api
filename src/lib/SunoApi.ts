@@ -94,7 +94,9 @@ class SunoApi {
   private cookies: Record<string, string | undefined>;
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
-  private keepBrowserOpen = yn(process.env.BROWSER_KEEP_OPEN, { default: false });
+  private keepBrowserOpen = yn(process.env.BROWSER_KEEP_OPEN, {
+    default: !yn(process.env.BROWSER_HEADLESS, { default: true })
+  });
   private cursor?: Cursor;
 
   // Persistent browser for reuse across requests (when BROWSER_KEEP_OPEN=true)
@@ -114,6 +116,14 @@ class SunoApi {
   private capturedBrowserEndpoint: string | null = null; // generate endpoint path captured from the browser's intercepted request
   private capturedSoundsEndpoint: string | null = null; // sounds endpoint path captured from the browser's intercepted request
   private capturedTurnstileSitekey: string | null = null; // Turnstile sitekey captured from network requests
+
+  private isHeadlessBrowser(): boolean {
+    return yn(process.env.BROWSER_HEADLESS, { default: true });
+  }
+
+  private shouldKeepBrowserOpen(): boolean {
+    return this.keepBrowserOpen && !this.isHeadlessBrowser();
+  }
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -197,8 +207,8 @@ class SunoApi {
       `⚙️   CONFIGURATION\n` +
       `${thin}\n` +
       `🌐  Browser             : ${(process.env.BROWSER ?? 'chromium').toUpperCase()}\n` +
-      `🖥️   Headless            : ${yn(process.env.BROWSER_HEADLESS, { default: true }) ? '✅ Yes (hidden)' : '❌ No (visible window)'}\n` +
-      `🪟  Keep browser open   : ${yn(process.env.BROWSER_KEEP_OPEN, { default: false }) ? '✅ Yes' : '❌ No'}\n` +
+      `🖥️   Headless            : ${this.isHeadlessBrowser() ? '✅ Yes (hidden)' : '❌ No (visible window)'}\n` +
+      `🪟  Keep browser open   : ${this.shouldKeepBrowserOpen() ? '✅ Yes' : '❌ No'}\n` +
       `🔒  Force CAPTCHA       : ${yn(process.env.BROWSER_FORCE_CAPTCHA, { default: false }) ? '✅ Always solve' : '❌ Auto (check endpoint)'}\n` +
       `👻  Ghost cursor        : ${yn(process.env.BROWSER_GHOST_CURSOR, { default: false }) ? '✅ Yes' : '❌ No'}\n` +
       `🌍  Browser locale      : ${process.env.BROWSER_LOCALE ?? 'en'}\n` +
@@ -731,6 +741,81 @@ class SunoApi {
     }
     logger.info(`launchBrowser: ${added} cookies added, ${skipped} skipped`);
     return context;
+  }
+
+  private async fetchPersonaWithBrowser(personaId: string, page: number): Promise<PersonaResponse> {
+    const shouldReuse = this.shouldKeepBrowserOpen();
+    let context = this._browserContext;
+    let browserPage = this._browserPage;
+
+    try {
+      if (!context || !browserPage || browserPage.isClosed()) {
+        context = await this.launchBrowser();
+        browserPage = await context.newPage();
+      }
+
+      if (!browserPage.url().startsWith('https://suno.com/')) {
+        await browserPage.goto('https://suno.com/create', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000
+        });
+      }
+
+      const result = await browserPage.evaluate(
+        async ({ personaId, page }) => {
+          const response = await fetch(`/api/persona/get-persona-paginated/${personaId}/?page=${page}`, {
+            credentials: 'include',
+            headers: {
+              accept: 'application/json, text/plain, */*'
+            }
+          });
+
+          const text = await response.text();
+
+          try {
+            return {
+              ok: response.ok,
+              status: response.status,
+              data: JSON.parse(text),
+              text
+            };
+          } catch {
+            return {
+              ok: response.ok,
+              status: response.status,
+              data: null,
+              text
+            };
+          }
+        },
+        { personaId, page }
+      );
+
+      if (!result.ok || !result.data?.persona) {
+        throw new Error(
+          `Browser persona fetch failed with status ${result.status}: ${result.text.slice(0, 300)}`
+        );
+      }
+
+      if (shouldReuse) {
+        this._browserContext = context;
+        this._browserPage = browserPage;
+      } else {
+        this._browserContext = null;
+        this._browserPage = null;
+        await context.browser()?.close();
+      }
+
+      return result.data as PersonaResponse;
+    } catch (error) {
+      if (!shouldReuse) {
+        this._browserContext = null;
+        this._browserPage = null;
+        await context?.browser()?.close().catch(() => undefined);
+      }
+
+      throw error;
+    }
   }
 
   /**
@@ -2377,20 +2462,29 @@ class SunoApi {
 
   public async getPersonaPaginated(personaId: string, page: number = 1): Promise<PersonaResponse> {
     await this.keepAlive(false);
-    
+
     const url = `${SunoApi.BASE_URL}/api/persona/get-persona-paginated/${personaId}/?page=${page}`;
-    
+
     logger.info(`Fetching persona data: ${url}`);
-    
-    const response = await this.client.get(url, {
-      timeout: 10000 // 10 seconds timeout
-    });
 
-    if (response.status !== 200) {
-      throw new Error('Error response: ' + response.statusText);
+    try {
+      const response = await this.client.get(url, {
+        timeout: 10000 // 10 seconds timeout
+      });
+
+      if (response.status !== 200) {
+        throw new Error('Error response: ' + response.statusText);
+      }
+
+      return response.data;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        logger.warn('Direct persona endpoint returned 404, retrying through authenticated browser context.');
+        return this.fetchPersonaWithBrowser(personaId, page);
+      }
+
+      throw error;
     }
-
-    return response.data;
   }
 }
 
