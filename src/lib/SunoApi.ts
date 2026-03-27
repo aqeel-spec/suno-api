@@ -18,7 +18,8 @@ const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
 const logger = pino();
-export const DEFAULT_MODEL = 'chirp-crow'; // v5 Pro
+export const FALLBACK_MODEL = 'chirp-crow'; // v5 Pro — hardcoded fallback if API detection fails
+export let DEFAULT_MODEL = FALLBACK_MODEL;
 
 export interface AudioInfo {
   id: string; // Unique identifier for the audio
@@ -116,6 +117,7 @@ class SunoApi {
   private capturedBrowserEndpoint: string | null = null; // generate endpoint path captured from the browser's intercepted request
   private capturedSoundsEndpoint: string | null = null; // sounds endpoint path captured from the browser's intercepted request
   private capturedTurnstileSitekey: string | null = null; // Turnstile sitekey captured from network requests
+  private detectedLatestModel: string | null = null; // latest model auto-detected from /api/model_overview/
 
   private isHeadlessBrowser(): boolean {
     return yn(process.env.BROWSER_HEADLESS, { default: true });
@@ -170,32 +172,200 @@ class SunoApi {
   }
 
   /**
+   * Queries Suno's model endpoints and picks the latest model.
+   *
+   * Tries multiple known endpoints in order since Suno changes these over time.
+   * Parses the response flexibly — handles arrays, nested objects, and deeply
+   * nested model lists.
+   *
+   * Heuristic for "latest" (in priority order):
+   *  1. Model explicitly marked as default/latest by the API
+   *  2. Model with the highest version-like display_name (e.g. "v5.5" > "v5")
+   *  3. Highest lexicographic chirp-* id (newer birds sort later)
+   *  4. First model in the list (Suno typically orders newest first)
+   *
+   * Updates both `this.detectedLatestModel` and the module-level `DEFAULT_MODEL`.
+   */
+  private async detectLatestModel(): Promise<{ list: any[]; raw: any }> {
+    const endpoints = [
+      '/api/model_overview/',
+      '/api/models/',
+      '/api/model/',
+    ];
+
+    let data: any = null;
+    let lastError: any = null;
+
+    for (const ep of endpoints) {
+      try {
+        const res = await this.client.get(`${SunoApi.BASE_URL}${ep}`, { timeout: 8000 });
+        data = res.data;
+        logger.info(`Model endpoint ${ep} responded (status ${res.status})`);
+        break;
+      } catch (err: any) {
+        lastError = err;
+        logger.debug(`Model endpoint ${ep} failed: ${err.response?.status ?? err.message}`);
+      }
+    }
+
+    if (data === null) {
+      // All model endpoints failed — try to infer the latest model from recent clips
+      return this.detectModelFromRecentClips(lastError);
+    }
+
+    // Flexibly extract the model list from various response shapes
+    const list: any[] = this.extractModelList(data);
+
+    if (list.length === 0) {
+      logger.warn(`Model endpoint returned data but no model list could be extracted. Raw keys: ${typeof data === 'object' ? Object.keys(data).join(', ') : typeof data}`);
+      return { list, raw: data };
+    }
+
+    const idOf = (m: any) => String(m.id ?? m.name ?? m.model_id ?? m.mv ?? m.external_key ?? '');
+
+    // 1. Explicit default/latest flag from the API
+    let best = list.find((m: any) =>
+      m.is_default === true || m.is_latest === true || m.default === true
+    );
+
+    // 2. Highest version number in display_name (e.g. "v5.5" beats "v5", "v4")
+    if (!best) {
+      const versionOf = (m: any): number => {
+        const label = m.display_name ?? m.title ?? m.label ?? '';
+        const match = String(label).match(/v(\d+(?:\.\d+)?)/i);
+        return match ? parseFloat(match[1]) : 0;
+      };
+      const withVersions = list.filter((m: any) => versionOf(m) > 0);
+      if (withVersions.length > 0) {
+        withVersions.sort((a: any, b: any) => versionOf(b) - versionOf(a));
+        best = withVersions[0];
+      }
+    }
+
+    // 3. Highest lexicographic chirp-* id (newer birds sort later alphabetically)
+    if (!best) {
+      const chirps = list.filter((m: any) => idOf(m).startsWith('chirp-'));
+      if (chirps.length > 0) {
+        chirps.sort((a: any, b: any) => idOf(b).localeCompare(idOf(a)));
+        best = chirps[0];
+      }
+    }
+
+    // 4. First entry (Suno usually lists newest first)
+    if (!best) best = list[0];
+
+    const detectedId = idOf(best);
+    if (detectedId) {
+      this.detectedLatestModel = detectedId;
+      DEFAULT_MODEL = detectedId;
+      const label = best.display_name ?? best.title ?? best.label ?? '';
+      logger.info(`Auto-detected latest model: ${detectedId}${label ? ` (${label})` : ''} (hardcoded fallback was: ${FALLBACK_MODEL})`);
+    }
+
+    return { list, raw: data };
+  }
+
+  /**
+   * Recursively extracts an array of model objects from an API response,
+   * handling various nesting patterns Suno has used over time.
+   */
+  private extractModelList(data: any): any[] {
+    if (Array.isArray(data)) return data;
+    if (typeof data !== 'object' || data === null) return [];
+
+    // Check common top-level keys
+    for (const key of ['models', 'data', 'items', 'results', 'model_list']) {
+      if (Array.isArray(data[key])) return data[key];
+    }
+
+    // If the object itself looks like a model map (keys are model ids)
+    const values = Object.values(data);
+    if (values.length > 0 && values.every((v: any) => typeof v === 'object' && v !== null && !Array.isArray(v))) {
+      const asArray = values.filter((v: any) =>
+        v.id || v.name || v.model_id || v.mv || v.external_key || v.display_name
+      );
+      if (asArray.length > 0) return asArray as any[];
+    }
+
+    // One level deeper — check nested objects for arrays
+    for (const val of values) {
+      if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') return val;
+    }
+
+    return [];
+  }
+
+  /**
+   * Fallback: when model endpoints are unavailable, fetch the user's recent clips
+   * and pick the newest model from the unique model_name values found.
+   *
+   * Picks the "latest" by sorting chirp-* names lexicographically descending
+   * (Suno uses bird names alphabetically: crow < fenix, so newer = later).
+   */
+  private async detectModelFromRecentClips(originalError: any): Promise<{ list: any[]; raw: any }> {
+    try {
+      const res = await this.client.get(`${SunoApi.BASE_URL}/api/feed/?page=0`, { timeout: 8000 });
+      const clips: any[] = res.data?.clips ?? res.data ?? [];
+      if (!Array.isArray(clips) || clips.length === 0) {
+        throw originalError ?? new Error('All model endpoints failed and no recent clips found');
+      }
+
+      const modelNames = [...new Set(
+        clips.map((c: any) => c.model_name).filter(Boolean)
+      )] as string[];
+
+      if (modelNames.length === 0) {
+        throw originalError ?? new Error('All model endpoints failed and clips have no model_name');
+      }
+
+      // Sort descending — for chirp-* names, later alphabetically = newer model
+      modelNames.sort((a, b) => b.localeCompare(a));
+      const latestModel = modelNames[0];
+
+      this.detectedLatestModel = latestModel;
+      DEFAULT_MODEL = latestModel;
+      logger.info(
+        `Auto-detected latest model from recent clips: ${latestModel} ` +
+        `(all found: ${modelNames.join(', ')}) (hardcoded fallback was: ${FALLBACK_MODEL})`
+      );
+
+      const list = modelNames.map(name => ({
+        id: name,
+        display_name: name,
+        status: 'active',
+        is_default: name === latestModel,
+      }));
+
+      return { list, raw: { source: 'recent_clips', model_names: modelNames } };
+    } catch (clipErr: any) {
+      logger.warn(`Fallback clip-based model detection also failed: ${clipErr.message}`);
+      throw originalError ?? clipErr;
+    }
+  }
+
+  /**
    * Fetches available Suno models and logs a full startup summary.
    */
   private async logStartupInfo(): Promise<void> {
-    // Try to fetch available models from Suno
     let modelsBlock = '  (could not fetch — models endpoint unavailable)';
     try {
-      const res = await this.client.get(`${SunoApi.BASE_URL}/api/model_overview/`, { timeout: 8000 });
-      const data = res.data;
-      // Suno returns either an array or an object with a list property
-      const list: any[] = Array.isArray(data) ? data
-        : Array.isArray(data?.models) ? data.models
-        : Array.isArray(data?.data)   ? data.data
-        : [];
+      const { list, raw } = await this.detectLatestModel();
       if (list.length > 0) {
         modelsBlock = list.map((m: any) => {
           const id      = m.id ?? m.name ?? m.model_id ?? m.mv ?? JSON.stringify(m);
           const label   = m.display_name ?? m.title ?? m.label ?? '';
           const status  = m.status ?? m.state ?? '';
           const isDefault = id === DEFAULT_MODEL;
-          return `  ${isDefault ? '👉' : '  '} ${id}${label ? ` — ${label}` : ''}${status ? ` [${status}]` : ''}${isDefault ? '  ← DEFAULT' : ''}`;
+          return `  ${isDefault ? '👉' : '  '} ${id}${label ? ` — ${label}` : ''}${status ? ` [${status}]` : ''}${isDefault ? '  ← DEFAULT (auto-detected)' : ''}`;
         }).join('\n');
       } else {
-        modelsBlock = `  (endpoint returned no model list — raw: ${JSON.stringify(data).slice(0, 120)})`;
+        modelsBlock = `  (endpoint returned no model list — raw: ${JSON.stringify(raw).slice(0, 120)})`;
       }
-    } catch {
-      // Silently fall back — the block stays as the error string above
+    } catch (err: any) {
+      const detail = err.response
+        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data).slice(0, 200)}`
+        : err.message ?? String(err);
+      logger.warn(`Could not auto-detect latest model — falling back to hardcoded ${FALLBACK_MODEL}. Error: ${detail}`);
     }
 
     const sep = '═'.repeat(55);
@@ -218,7 +388,7 @@ class SunoApi {
       `🔑  2Captcha key        : ${process.env.TWOCAPTCHA_KEY ? process.env.TWOCAPTCHA_KEY.slice(0, 6) + '…' + process.env.TWOCAPTCHA_KEY.slice(-4) : '❌ NOT SET'}\n` +
       `🍪  Cookie present      : ${process.env.SUNO_COOKIE ? '✅' : '❌'} (${process.env.SUNO_COOKIE?.length ?? 0} chars)\n` +
       `${thin}\n` +
-      `🤖  AVAILABLE MODELS    (default: ${DEFAULT_MODEL})\n` +
+      `🤖  AVAILABLE MODELS    (default: ${DEFAULT_MODEL}${this.detectedLatestModel ? ' — auto-detected' : ' — hardcoded fallback'})\n` +
       `${thin}\n` +
       `${modelsBlock}\n` +
       `${sep}`
@@ -2487,6 +2657,49 @@ class SunoApi {
     };
   }
 
+  /**
+   * Returns available models from Suno's API, the currently active
+   * default model, and whether it was auto-detected or is the hardcoded fallback.
+   */
+  public async getModels(): Promise<{
+    models: any[];
+    default_model: string;
+    fallback_model: string;
+    auto_detected: boolean;
+    error?: string;
+    raw_response?: any;
+  }> {
+    await this.keepAlive(false);
+
+    try {
+      const { list, raw } = await this.detectLatestModel();
+      return {
+        models: list.map((m: any) => ({
+          id: m.id ?? m.name ?? m.model_id ?? m.mv ?? m.external_key ?? null,
+          display_name: m.display_name ?? m.title ?? m.label ?? null,
+          status: m.status ?? m.state ?? null,
+          is_default: String(m.id ?? m.name ?? m.model_id ?? m.mv ?? m.external_key ?? '') === DEFAULT_MODEL,
+        })),
+        default_model: DEFAULT_MODEL,
+        fallback_model: FALLBACK_MODEL,
+        auto_detected: this.detectedLatestModel !== null,
+        ...(list.length === 0 ? { raw_response: typeof raw === 'object' ? raw : String(raw).slice(0, 500) } : {}),
+      };
+    } catch (error: any) {
+      const msg = error.response
+        ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 300)}`
+        : error.message ?? String(error);
+      logger.error(`getModels failed: ${msg}`);
+      return {
+        models: [],
+        default_model: DEFAULT_MODEL,
+        fallback_model: FALLBACK_MODEL,
+        auto_detected: this.detectedLatestModel !== null,
+        error: msg,
+      };
+    }
+  }
+
   public async getPersonaPaginated(personaId: string, page: number = 1): Promise<PersonaResponse> {
     await this.keepAlive(false);
 
@@ -2522,9 +2735,10 @@ export const sunoApi = async (cookie?: string) => {
     throw new Error('Please provide a cookie either in the .env file or in the Cookie header of your request.');
   }
 
-  // Check if the instance for this cookie already exists in the cache
+  // Check if the instance for this cookie already exists in the cache.
+  // Validate it's from the current class definition (hot-reload can leave stale instances).
   const cachedInstance = cache.get(resolvedCookie);
-  if (cachedInstance)
+  if (cachedInstance && cachedInstance instanceof SunoApi)
     return cachedInstance;
 
   // If not, create a new instance and initialize it
