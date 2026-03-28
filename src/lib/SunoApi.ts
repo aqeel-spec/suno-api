@@ -13,7 +13,10 @@ import { promises as fs } from 'fs';
 import path from 'node:path';
 
 // sunoApi instance caching
-const globalForSunoApi = global as unknown as { sunoApiCache?: Map<string, SunoApi> };
+const globalForSunoApi = global as unknown as {
+  sunoApiCache?: Map<string, SunoApi>;
+  generatedAssetsStore?: GeneratedAsset[];
+};
 const cache = globalForSunoApi.sunoApiCache || new Map<string, SunoApi>();
 globalForSunoApi.sunoApiCache = cache;
 
@@ -21,23 +24,97 @@ const logger = pino();
 export const FALLBACK_MODEL = 'chirp-crow'; // v5 Pro — hardcoded fallback if API detection fails
 export let DEFAULT_MODEL = FALLBACK_MODEL;
 
+/**
+ * Tracks every asset produced by a generation call so consumers can look up
+ * the Suno-provided thumbnail (`image_url`) instead of re-generating one.
+ */
+export interface GeneratedAsset {
+  id: string;
+  title?: string;
+  image_url?: string;
+  audio_url?: string;
+  video_url?: string;
+  model_name?: string;
+  tags?: string;
+  duration?: string;
+  status: string;
+  source: 'generate' | 'custom_generate' | 'generate_sounds' | 'extend_audio' | 'generate_stems' | 'concatenate';
+  created_at: string;
+  recorded_at: string;
+}
+
+const generatedAssets: GeneratedAsset[] = globalForSunoApi.generatedAssetsStore || [];
+globalForSunoApi.generatedAssetsStore = generatedAssets;
+
+function recordAssets(audios: AudioInfo[], source: GeneratedAsset['source']): void {
+  const now = new Date().toISOString();
+  for (const a of audios) {
+    const existing = generatedAssets.find(r => r.id === a.id);
+    if (existing) {
+      Object.assign(existing, {
+        title: a.title ?? existing.title,
+        image_url: a.image_url ?? existing.image_url,
+        audio_url: a.audio_url ?? existing.audio_url,
+        video_url: a.video_url ?? existing.video_url,
+        model_name: a.model_name ?? existing.model_name,
+        tags: a.tags ?? existing.tags,
+        duration: a.duration ?? existing.duration,
+        status: a.status,
+        recorded_at: now,
+      });
+    } else {
+      generatedAssets.unshift({
+        id: a.id,
+        title: a.title,
+        image_url: a.image_url,
+        audio_url: a.audio_url,
+        video_url: a.video_url,
+        model_name: a.model_name,
+        tags: a.tags,
+        duration: a.duration,
+        status: a.status,
+        source,
+        created_at: a.created_at,
+        recorded_at: now,
+      });
+    }
+  }
+}
+
+export function getGeneratedAssets(): GeneratedAsset[] {
+  return generatedAssets;
+}
+
+export function getGeneratedAssetById(id: string): GeneratedAsset | undefined {
+  return generatedAssets.find(a => a.id === id);
+}
+
+export interface AlignedWord {
+  word: string;
+  start_s: number;
+  end_s: number;
+  success?: boolean;
+  p_align?: number;
+}
+
 export interface AudioInfo {
-  id: string; // Unique identifier for the audio
-  title?: string; // Title of the audio
-  image_url?: string; // URL of the image associated with the audio
-  lyric?: string; // Lyrics of the audio
-  audio_url?: string; // URL of the audio file
-  video_url?: string; // URL of the video associated with the audio
-  created_at: string; // Date and time when the audio was created
-  model_name: string; // Name of the model used for audio generation
-  gpt_description_prompt?: string; // Prompt for GPT description
-  prompt?: string; // Prompt for audio generation
-  status: string; // Status
+  id: string;
+  title?: string;
+  image_url?: string;
+  lyric?: string;
+  audio_url?: string;
+  video_url?: string;
+  created_at: string;
+  model_name: string;
+  gpt_description_prompt?: string;
+  prompt?: string;
+  status: string;
   type?: string;
-  tags?: string; // Genre of music.
-  negative_tags?: string; // Negative tags of music.
-  duration?: string; // Duration of the audio
-  error_message?: string; // Error message if any
+  tags?: string;
+  negative_tags?: string;
+  duration?: string;
+  error_message?: string;
+  aligned_lyrics?: AlignedWord[];
 }
 
 /**
@@ -2023,6 +2100,7 @@ class SunoApi {
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
     logger.info('Cost time: ' + costTime);
+    recordAssets(audios, 'generate');
     return audios;
   }
 
@@ -2046,7 +2124,25 @@ class SunoApi {
     if (response.status !== 200) {
       throw new Error('Error response:' + response.statusText);
     }
-    return response.data;
+    const audio = response.data;
+    const result: AudioInfo = {
+      id: audio.id,
+      title: audio.title,
+      image_url: audio.image_url,
+      lyric: audio.metadata?.prompt,
+      audio_url: audio.audio_url,
+      video_url: audio.video_url,
+      created_at: audio.created_at,
+      model_name: audio.model_name,
+      status: audio.status,
+      gpt_description_prompt: audio.metadata?.gpt_description_prompt,
+      prompt: audio.metadata?.prompt,
+      type: audio.metadata?.type,
+      tags: audio.metadata?.tags,
+      duration: audio.metadata?.duration,
+    };
+    recordAssets([result], 'concatenate');
+    return result;
   }
 
   /**
@@ -2091,6 +2187,7 @@ class SunoApi {
       'Custom Generate Response:\n' + JSON.stringify(audios, null, 2)
     );
     logger.info('Cost time: ' + costTime);
+    recordAssets(audios, 'custom_generate');
     return audios;
   }
 
@@ -2210,14 +2307,18 @@ class SunoApi {
           const resp = await this.get(songIds);
           const allDone = resp.every(a => a.status === 'streaming' || a.status === 'complete');
           const allError = resp.every(a => a.status === 'error');
-          if (allDone || allError) return resp;
+          if (allDone || allError) {
+            recordAssets(resp, 'generate_sounds');
+            return resp;
+          }
           lastResponse = resp;
           await sleep(3, 6);
           await this.keepAlive(true);
         }
+        recordAssets(lastResponse, 'generate_sounds');
         return lastResponse;
       } else {
-        return response.data.clips.map((audio: any) => ({
+        const audios: AudioInfo[] = response.data.clips.map((audio: any) => ({
           id: audio.id,
           title: audio.title,
           image_url: audio.image_url,
@@ -2233,6 +2334,8 @@ class SunoApi {
           tags: audio.metadata?.tags,
           duration: audio.metadata?.duration,
         }));
+        recordAssets(audios, 'generate_sounds');
+        return audios;
       }
     } finally {
       logger.info(`[req-${reqId}] Released slot`);
@@ -2520,7 +2623,9 @@ class SunoApi {
     model?: string,
     wait_audio?: boolean
   ): Promise<AudioInfo[]> {
-    return this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    const audios = await this.generateSongs(prompt, true, tags, title, false, model, wait_audio, negative_tags, 'extend', audioId, continueAt);
+    recordAssets(audios, 'extend_audio');
+    return audios;
   }
 
   /**
@@ -2534,15 +2639,25 @@ class SunoApi {
       `${SunoApi.BASE_URL}/api/edit/stems/${song_id}`, {}
     );
 
-    console.log('generateStems response:\n', response?.data);
-    return response.data.clips.map((clip: any) => ({
+    logger.info('generateStems response:\n' + JSON.stringify(response?.data, null, 2));
+    const audios: AudioInfo[] = response.data.clips.map((clip: any) => ({
       id: clip.id,
-      status: clip.status,
-      created_at: clip.created_at,
       title: clip.title,
-      stem_from_id: clip.metadata.stem_from_id,
-      duration: clip.metadata.duration
+      image_url: clip.image_url,
+      lyric: clip.metadata?.prompt,
+      audio_url: clip.audio_url,
+      video_url: clip.video_url,
+      created_at: clip.created_at,
+      model_name: clip.model_name,
+      status: clip.status,
+      gpt_description_prompt: clip.metadata?.gpt_description_prompt,
+      prompt: clip.metadata?.prompt,
+      type: clip.metadata?.type,
+      tags: clip.metadata?.tags,
+      duration: clip.metadata?.duration,
     }));
+    recordAssets(audios, 'generate_stems');
+    return audios;
   }
 
 
@@ -2551,18 +2666,33 @@ class SunoApi {
    * @param song_id The ID of the song to get the lyric alignment for.
    * @returns A promise that resolves to an object containing the lyric alignment.
    */
-  public async getLyricAlignment(song_id: string): Promise<object> {
+  public async getLyricAlignment(song_id: string): Promise<AlignedWord[]> {
     await this.keepAlive(false);
     const response = await this.client.get(`${SunoApi.BASE_URL}/api/gen/${song_id}/aligned_lyrics/v2/`);
 
-    console.log(`getLyricAlignment ~ response:`, response.data);
-    return response.data?.aligned_words.map((transcribedWord: any) => ({
-      word: transcribedWord.word,
-      start_s: transcribedWord.start_s,
-      end_s: transcribedWord.end_s,
-      success: transcribedWord.success,
-      p_align: transcribedWord.p_align
+    const words = response.data?.aligned_words;
+    if (!Array.isArray(words)) return [];
+
+    return words.map((w: any) => ({
+      word: w.word,
+      start_s: w.start_s,
+      end_s: w.end_s,
+      success: w.success,
+      p_align: w.p_align,
     }));
+  }
+
+  /**
+   * Fetches aligned lyrics for a song, returning null on failure
+   * (e.g. song still processing, instrumental, or endpoint unavailable).
+   */
+  private async tryGetAlignedLyrics(song_id: string): Promise<AlignedWord[] | null> {
+    try {
+      const words = await this.getLyricAlignment(song_id);
+      return words.length > 0 ? words : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -2610,7 +2740,7 @@ class SunoApi {
 
     const audios = response.data.clips;
 
-    return audios.map((audio: any) => ({
+    const results: AudioInfo[] = audios.map((audio: any) => ({
       id: audio.id,
       title: audio.title,
       image_url: audio.image_url,
@@ -2629,6 +2759,19 @@ class SunoApi {
       duration: audio.metadata.duration,
       error_message: audio.metadata.error_message
     }));
+
+    // Fetch aligned lyrics in parallel for completed, non-instrumental songs
+    const alignmentPromises = results.map(async (audio) => {
+      if (
+        (audio.status === 'complete' || audio.status === 'streaming') &&
+        audio.lyric
+      ) {
+        audio.aligned_lyrics = await this.tryGetAlignedLyrics(audio.id) ?? undefined;
+      }
+    });
+    await Promise.all(alignmentPromises);
+
+    return results;
   }
 
   /**
