@@ -968,15 +968,38 @@ class SunoApi {
       '--disable-extensions',
       '--disable-infobars'
     ];
-    // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
       args.push('--enable-unsafe-swiftshader',
         '--disable-gpu',
         '--disable-setuid-sandbox');
-    const browser = await this.getBrowserType().launch({
+
+    const launchOptions: any = {
       args,
-      headless: yn(process.env.BROWSER_HEADLESS, { default: true })
-    });
+      headless: yn(process.env.BROWSER_HEADLESS, { default: true }),
+    };
+
+    // Allow explicit executable path via env var (useful on VPS/Docker where
+    // the auto-detected path from @playwright/browser-chromium may not match)
+    if (process.env.BROWSER_EXECUTABLE_PATH) {
+      launchOptions.executablePath = process.env.BROWSER_EXECUTABLE_PATH;
+    }
+
+    let browser;
+    try {
+      browser = await this.getBrowserType().launch(launchOptions);
+    } catch (err: any) {
+      if (err.message?.includes("Executable doesn't exist")) {
+        const hint =
+          'Playwright browser binary not found. Run one of:\n' +
+          '  npx playwright install chromium          # install browser only\n' +
+          '  npx playwright install --with-deps chromium  # install browser + system deps (Linux)\n' +
+          '  npm run setup:linux                      # full VPS setup script\n' +
+          'Or set BROWSER_EXECUTABLE_PATH in .env to point to an existing Chrome/Chromium binary.';
+        logger.error(hint);
+        throw new Error(`Browser not installed: ${err.message}\n\n${hint}`);
+      }
+      throw err;
+    }
     const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
 
     // Chrome CDP is very strict: cookie names/values must be RFC 6265 safe.
