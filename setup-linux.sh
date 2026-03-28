@@ -29,7 +29,7 @@ fi
 # 2. Install npm dependencies
 echo ""
 echo "[2/4] Installing npm dependencies..."
-npm install
+npm install --legacy-peer-deps
 
 # 3. Install Playwright Chromium browser
 echo ""
