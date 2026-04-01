@@ -9,7 +9,7 @@ export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
-      const { audio_id } = body;
+      const { audio_id, wait_audio } = body;
 
       if (!audio_id) {
         return new NextResponse(JSON.stringify({ error: 'Audio ID is required' }), {
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
       }
 
       const audioInfo = await (await sunoApi((await cookies()).toString()))
-        .generateStems(audio_id);
+        .generateStems(audio_id, wait_audio === true || wait_audio === 'true');
 
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
@@ -32,9 +32,9 @@ export async function POST(req: NextRequest) {
         }
       });
     } catch (error: any) {
-      console.error('Error generating stems:', JSON.stringify(error.response.data));
-      if (error.response.status === 402) {
-        return new NextResponse(JSON.stringify({ error: error.response.data.detail }), {
+      console.error('Error generating stems:', error?.response?.data || error?.message || error);
+      if (error?.response?.status === 402) {
+        return new NextResponse(JSON.stringify({ error: error?.response?.data?.detail || 'Account Upgrade Required' }), {
           status: 402,
           headers: {
             'Content-Type': 'application/json',
@@ -42,8 +42,9 @@ export async function POST(req: NextRequest) {
           }
         });
       }
-      return new NextResponse(JSON.stringify({ error: 'Internal server error: ' + JSON.stringify(error.response.data.detail) }), {
-        status: 500,
+      const statusCode = error?.response?.status || 500;
+      return new NextResponse(JSON.stringify({ error: 'Upstream error: ' + (error?.response?.data?.detail || error?.message || String(error)) }), {
+        status: statusCode,
         headers: {
           'Content-Type': 'application/json',
           ...corsHeaders

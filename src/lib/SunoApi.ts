@@ -1219,7 +1219,22 @@ class SunoApi {
       // Always use the browser flow — externally-solved Turnstile tokens (via 2Captcha)
       // are rejected by Suno because they lack the proper Cloudflare session binding.
       // The browser's own invisible Turnstile produces tokens that Suno's backend accepts.
-      return await this._solveCaptcha(tabMode);
+      const maxAttempts = parseInt(process.env.RETRY_ATTEMPTS || '1', 10);
+      let attempt = 0;
+
+      while (true) {
+        attempt++;
+        try {
+          return await this._solveCaptcha(tabMode);
+        } catch (err: any) {
+          logger.error(`getCaptcha attempt ${attempt} failed: ${err.message}`);
+          if (attempt >= maxAttempts) {
+            throw err;
+          }
+          logger.info(`Retrying getCaptcha (Attempt ${attempt + 1} of ${maxAttempts})...`);
+          await sleep(2, 5); // Short wait before next attempt
+        }
+      }
     } finally {
       releaseCaptcha();
     }
@@ -1229,6 +1244,14 @@ class SunoApi {
    * Internal CAPTCHA-solving logic (called under captchaMutex).
    */
   private async _solveCaptcha(tabMode: 'advanced' | 'sounds' = 'advanced'): Promise<string|null> {
+
+    // Reset per-run captures so stale values from previous browser sessions do not leak.
+    this.capturedBrowserModel = null;
+    if (tabMode === 'sounds') {
+      this.capturedSoundsEndpoint = null;
+    } else {
+      this.capturedBrowserEndpoint = null;
+    }
 
     let browser!: BrowserContext;
     let page!: Page;
@@ -1530,9 +1553,23 @@ class SunoApi {
             return route.continue();
           }
 
+          const postData = request.postDataJSON();
+
+          // Ignore non-song actions that can appear from previously selected UI state
+          // (e.g. stem/remix flows). Capturing these corrupts endpoint/model selection.
+          const task = String(postData?.task || '').toLowerCase();
+          const isStemFlow = task === 'gen_stem'
+            || postData?.stem_task != null
+            || postData?.stem_type_id != null;
+          if (isStemFlow) {
+            logger.info(
+              `Skipping non-song generate request (task=${task || 'unknown'}, stem_task=${String(postData?.stem_task || '')})`
+            );
+            return route.continue();
+          }
+
           logger.info('Generate API call intercepted! Extracting token and closing browser');
           this.currentToken = request.headers().authorization?.split('Bearer ').pop();
-          const postData = request.postDataJSON();
           // Capture the model the browser sent so we can mirror it in our API call
           if (postData?.mv) {
             this.capturedBrowserModel = postData.mv;
@@ -2656,13 +2693,37 @@ class SunoApi {
    * @param song_id The ID of the song to generate stems for.
    * @returns A promise that resolves to an AudioInfo object representing the generated stems.
    */
-  public async generateStems(song_id: string): Promise<AudioInfo[]> {
+  public async generateStems(song_id: string, wait_audio: boolean = false): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const response = await this.client.post(
       `${SunoApi.BASE_URL}/api/edit/stems/${song_id}`, {}
     );
 
     logger.info('generateStems response:\n' + JSON.stringify(response?.data, null, 2));
+    const songIds = response.data.clips.map((clip: any) => clip.id);
+
+    if (wait_audio) {
+      const startTime = Date.now();
+      let lastResponse: AudioInfo[] = [];
+      await sleep(5, 5);
+      while (Date.now() - startTime < 100000) {
+        const clipsResponse = await this.get(songIds);
+        const allCompleted = clipsResponse.every(
+          (audio) => audio.status === 'streaming' || audio.status === 'complete'
+        );
+        const allError = clipsResponse.every((audio) => audio.status === 'error');
+        if (allCompleted || allError) {
+          recordAssets(clipsResponse, 'generate_stems');
+          return clipsResponse;
+        }
+        lastResponse = clipsResponse;
+        await sleep(3, 6);
+        await this.keepAlive(true);
+      }
+      recordAssets(lastResponse, 'generate_stems');
+      return lastResponse;
+    }
+
     const audios: AudioInfo[] = response.data.clips.map((clip: any) => ({
       id: clip.id,
       title: clip.title,
