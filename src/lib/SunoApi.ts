@@ -1134,13 +1134,57 @@ class SunoApi {
   }
 
   /**
+   * Wait until the create composer appears to be usable.
+   * This avoids racing while the app is still hydrating/navigating.
+   */
+  private async waitForComposerReady(page: Page, timeout = 45000): Promise<boolean> {
+    const readinessSelectors = [
+      'button[aria-label="Create song"]',
+      'button:has-text("Create")',
+      'button:has-text("Advanced")',
+      'button:has-text("Simple")',
+      'button:has-text("Sounds")',
+      'textarea[placeholder*="describe" i]',
+      'textarea[placeholder*="lyrics" i]',
+      'textarea',
+    ];
+
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      for (const selector of readinessSelectors) {
+        const visible = await page.locator(selector).first().isVisible().catch(() => false);
+        if (visible)
+          return true;
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    return false;
+  }
+
+  /**
    * Saves full-page HTML, screenshot, and request log into the debug/ folder.
    */
   private async saveDebugSnapshot(page: Page, label: string, requestLog?: string[]): Promise<void> {
     const debugDir = path.join(process.cwd(), 'debug');
     try {
       await fs.mkdir(debugDir, { recursive: true });
-      await fs.writeFile(path.join(debugDir, `${label}.html`), await page.content());
+      let html = '';
+      let contentCaptured = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => undefined);
+          html = await page.content();
+          contentCaptured = true;
+          break;
+        } catch (err: any) {
+          if (attempt === 3)
+            throw err;
+          await new Promise(r => setTimeout(r, 400));
+        }
+      }
+      if (contentCaptured)
+        await fs.writeFile(path.join(debugDir, `${label}.html`), html);
       await page.screenshot({ path: path.join(debugDir, `${label}.png`), fullPage: true });
       if (requestLog) {
         await fs.writeFile(path.join(debugDir, `${label}-requests.log`), requestLog.join('\n'));
@@ -1315,6 +1359,10 @@ class SunoApi {
       logger.warn('Network did not reach idle state within 30s; continuing');
     }
 
+    const composerReady = await this.waitForComposerReady(page, 45000);
+    if (!composerReady)
+      logger.warn('Create composer did not look ready within timeout; continuing with best-effort selectors');
+
     // --- Debug snapshot: page loaded ---
     await this.saveDebugSnapshot(page, '01-page-loaded', requestLog);
 
@@ -1369,13 +1417,16 @@ class SunoApi {
       ? [
           'button:has-text("Sounds")',
           '[role="button"]:has-text("Sounds")',
+          '[role="tab"]:has-text("Sounds")',
           'button:has-text("Sound")',
         ]
       : [
           'button:has-text("Advanced")',
           '[role="button"]:has-text("Advanced")',
+          '[role="tab"]:has-text("Advanced")',
           'button:has-text("Custom")',        // fallback: old label
           '[role="button"]:has-text("Custom")',
+          '[role="tab"]:has-text("Custom")',
         ];
     let tabClicked = false;
     for (const sel of tabSelectors) {
@@ -1394,6 +1445,10 @@ class SunoApi {
     if (!tabClicked) {
       logger.warn(`${tabLabel} tab not found — continuing in default (Auto) mode`);
     }
+
+    const activeMode: 'advanced' | 'sounds' | 'default' = tabClicked ? tabMode : 'default';
+    logger.info(`Resolved active form mode: ${activeMode}`);
+
     await this.saveDebugSnapshot(page, '03-after-advanced-tab', requestLog);
 
     // --- Step 2: Seed the form just enough to enable Create ---
@@ -1403,7 +1458,7 @@ class SunoApi {
     // simple prompt fill path because that tab requires a description.
     let fillSucceeded = false;
     try {
-      if (tabMode === 'sounds') {
+      if (activeMode === 'sounds') {
         logger.info('Looking for sound prompt input');
         const promptSelectors = [
           'textarea[placeholder*="sound" i]',
@@ -1426,7 +1481,7 @@ class SunoApi {
           logger.warn('No sound prompt input found anywhere on page');
           await this.saveDebugSnapshot(page, '04-no-prompt-input', requestLog);
         }
-      } else {
+      } else if (activeMode === 'advanced') {
         logger.info('Advanced mode detected — using Instrumental + style chips instead of lyrics typing');
 
         const instrumentalToggle = page.locator('button[aria-label*="instrumental" i]').first();
@@ -1458,6 +1513,31 @@ class SunoApi {
         } else {
           logger.warn('No style suggestion chips found — Create button may stay disabled');
         }
+      } else {
+        logger.info('Default mode detected — filling a plain prompt to unlock Create button');
+        const defaultPromptSelectors = [
+          'textarea[placeholder*="describe" i]',
+          'textarea[placeholder*="song" i]',
+          'textarea',
+          'input[placeholder*="describe" i]',
+          'input[placeholder*="song" i]',
+        ];
+        const defaultPrompt = await this.waitForAnyVisibleLocator(page, defaultPromptSelectors, 15000);
+        if (defaultPrompt) {
+          await defaultPrompt.click({ force: true }).catch(() => undefined);
+          await this.reactFill(defaultPrompt, 'cinematic electronic instrumental, warm pads, subtle drums').catch(() => undefined);
+          await defaultPrompt.fill('cinematic electronic instrumental, warm pads, subtle drums').catch(() => undefined);
+
+          const val = await defaultPrompt.evaluate((el: Element) => {
+            if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement)
+              return el.value || '';
+            return '';
+          }).catch(() => '');
+          fillSucceeded = val.length > 0;
+          logger.info(`Default prompt seeded (length=${val.length})`);
+        } else {
+          logger.warn('No default-mode prompt input found');
+        }
       }
     } catch (fillErr: any) {
       logger.warn(
@@ -1469,9 +1549,11 @@ class SunoApi {
     // --- Step 3: Find and click the Create / Generate button ---
     logger.info('Looking for Create/Generate button');
     const buttonSelectors = [
+      'button[aria-label="Create song"]',
       'button[aria-label="Create"]',
       'button:has-text("Create")',
       '[role="button"]:has-text("Create")',
+      '[role="tab"]:has-text("Create")',
       'button[type="submit"]',
       'button:has-text("Generate")',
       '[role="button"]:has-text("Generate")',
@@ -1522,6 +1604,24 @@ class SunoApi {
       }
       const finalDisabled = await button.evaluate((el: Element) => (el as HTMLButtonElement).disabled).catch(() => true);
       if (finalDisabled) {
+        if (!fillSucceeded) {
+          logger.warn('Create button still disabled and initial seeding was weak — retrying with generic prompt fill');
+          const fallbackPrompt = await this.waitForAnyVisibleLocator(page, [
+            'textarea[placeholder*="describe" i]',
+            'textarea[placeholder*="song" i]',
+            'textarea[placeholder*="lyrics" i]',
+            'textarea',
+            'input[placeholder*="describe" i]',
+            'input[placeholder*="song" i]',
+          ], 10000);
+          if (fallbackPrompt) {
+            await fallbackPrompt.click({ force: true }).catch(() => undefined);
+            await this.reactFill(fallbackPrompt, 'ambient cinematic instrumental').catch(() => undefined);
+            await fallbackPrompt.fill('ambient cinematic instrumental').catch(() => undefined);
+            await new Promise(r => setTimeout(r, 800));
+          }
+        }
+
         logger.warn('Create button still disabled after extended timeout — will try force-enable after CAPTCHA detection');
         await this.saveDebugSnapshot(page, '04-button-still-disabled', requestLog);
       }
