@@ -1,0 +1,1664 @@
+openapi: 3.0.3
+info:
+  title: Suno API
+  description: |
+    A REST API wrapper around Suno.ai that enables programmatic song generation, audio extension,
+    stem extraction, lyrics generation, and more. Built with Next.js and TypeScript.
+
+    ## Authentication
+    All generation endpoints require a valid Suno session cookie configured via the `SUNO_COOKIE`
+    environment variable on the server. No per-request auth header is needed by API consumers.
+
+    ## Credits
+    - Song generation (generate, custom_generate, generate_sounds, extend_audio): **10 credits**
+    - Concatenation: **5 credits**
+    - Read-only endpoints (get, clip, models, get_limit, etc.): **free**
+    - Lyrics generation: **free**
+
+    ## Status Flow
+    ```
+    submitted → queued → streaming → complete
+                       ↘ error
+    ```
+    Poll `/api/get?ids=<id>` until `status` is `complete` or `error`.
+  version: "1.0.0"
+  contact:
+    name: Suno API
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Generation
+    description: Create new audio content
+  - name: Audio Management
+    description: Retrieve, extend, and manage audio clips
+  - name: Lyrics
+    description: Generate and retrieve lyrics
+  - name: Account
+    description: Account info and limits
+  - name: Models
+    description: Available Suno models
+  - name: Persona
+    description: Voice cloning personas
+  - name: Assets
+    description: Locally stored generated asset records
+  - name: Utility
+    description: Testing and diagnostic endpoints
+  - name: OpenAI-Compatible
+    description: OpenAI API-compatible endpoint for LLM integrations
+
+paths:
+
+  # ─────────────────────────────────────────────
+  # GENERATION
+  # ─────────────────────────────────────────────
+
+  /api/generate:
+    post:
+      tags: [Generation]
+      summary: Auto-mode song generation
+      description: |
+        Generate a song from a plain-text description. Suno automatically writes lyrics,
+        selects style tags, and creates 2 audio clips.
+        **Costs 10 credits.**
+      operationId: generateSong
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateRequest'
+            examples:
+              basic:
+                summary: Simple prompt
+                value:
+                  prompt: "A happy upbeat pop song about summer vacation"
+              withOptions:
+                summary: With model and wait
+                value:
+                  prompt: "Dark moody electronic instrumental"
+                  make_instrumental: true
+                  model: "chirp-crow"
+                  wait_audio: true
+      responses:
+        '200':
+          description: Array of 2 generated audio clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/custom_generate:
+    post:
+      tags: [Generation]
+      summary: Custom song generation with full control
+      description: |
+        Generate a song with explicit lyrics, style tags, title, and advanced options
+        (vocal gender, weirdness, style influence, voice cloning persona).
+        **Costs 10 credits.**
+      operationId: customGenerateSong
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomGenerateRequest'
+            examples:
+              basic:
+                summary: Basic custom generation
+                value:
+                  prompt: "[Verse]\nWalking down the neon streets at night\n[Chorus]\nCity lights are burning bright"
+                  tags: "synthwave, electronic, 80s"
+                  title: "Neon City Dreams"
+              advanced:
+                summary: With all advanced options
+                value:
+                  prompt: "[Verse]\nOcean waves crash on the shore\n[Chorus]\nFind me where the seagulls soar"
+                  tags: "acoustic, folk, calm"
+                  title: "By the Sea"
+                  vocal_gender: "female"
+                  weirdness: 30
+                  style_influence: 70
+                  negative_tags: "heavy metal, distortion"
+                  wait_audio: true
+      responses:
+        '200':
+          description: Array of 2 generated audio clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/generate_similar:
+    post:
+      tags: [Generation]
+      summary: Generate a song inspired by a reference audio clip
+      description: |
+        Provide an existing Suno clip UUID as a style reference. The API generates
+        2 new songs that follow the same style, key, and feel as the reference — starting
+        from scratch rather than extending it.
+
+        Optionally override lyrics (`prompt`), style tags, and title. If omitted, Suno
+        derives style automatically from the reference clip.
+
+        Internally this uses `continue_clip_id` with `continue_at=0`, which tells Suno
+        to anchor the new generation to the reference clip's style from timestamp 0.
+
+        **Costs 10 credits.**
+      operationId: generateSimilar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateSimilarRequest'
+            examples:
+              styleOnly:
+                summary: Pure style reference — no overrides
+                value:
+                  reference_audio_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              withOverrides:
+                summary: Style reference with custom lyrics and tags
+                value:
+                  reference_audio_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  prompt: "[Verse]\nNew words in the same vibe\n[Chorus]\nKeep that feeling alive"
+                  tags: "synthwave, melancholic, 80s"
+                  title: "Echoes of the Original"
+                  wait_audio: true
+      responses:
+        '200':
+          description: Array of 2 newly generated clips inspired by the reference
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/generate_sounds:
+    post:
+      tags: [Generation]
+      summary: Generate sound effects
+      description: |
+        Generate non-vocal sound effects from a text description.
+        Uses the Suno Sounds tab under the hood.
+      operationId: generateSounds
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateSoundsRequest'
+            examples:
+              rain:
+                summary: Rain sound effect
+                value:
+                  prompt: "Heavy rain on a tin roof with distant thunder"
+                  wait_audio: false
+      responses:
+        '200':
+          description: Array of generated audio clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # LYRICS
+  # ─────────────────────────────────────────────
+
+  /api/generate_lyrics:
+    post:
+      tags: [Lyrics]
+      summary: Generate lyrics only (free, no audio)
+      description: |
+        Generate formatted song lyrics for a given theme or concept.
+        Returns lyrics with section markers (`[Verse]`, `[Chorus]`, etc.).
+        **No credits consumed.**
+      operationId: generateLyrics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateLyricsRequest'
+            examples:
+              basic:
+                summary: Lyric prompt
+                value:
+                  prompt: "A song about missing someone who moved away"
+      responses:
+        '200':
+          description: Generated lyrics object
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LyricsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # AUDIO MANAGEMENT
+  # ─────────────────────────────────────────────
+
+  /api/get:
+    get:
+      tags: [Audio Management]
+      summary: Poll clip status / retrieve audio URLs
+      description: |
+        Retrieve one or more audio clips by their UUIDs. Use this to poll for completion
+        after a generation call. Returns audio and video URLs once `status` is `complete`.
+        **Free.**
+      operationId: getClips
+      parameters:
+        - name: ids
+          in: query
+          description: Comma-separated list of clip UUIDs
+          required: false
+          schema:
+            type: string
+          example: "abc123,def456"
+        - name: page
+          in: query
+          description: Page number for paginated listing (mutually exclusive with `ids`)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: id
+          in: query
+          description: Single clip UUID (deprecated — prefer `ids`)
+          required: false
+          deprecated: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Array of audio clip objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/clip:
+    get:
+      tags: [Audio Management]
+      summary: Get detailed info for a single clip
+      description: |
+        Returns the raw Suno API response object for a single clip UUID.
+        **Free.**
+      operationId: getClip
+      parameters:
+        - name: id
+          in: query
+          description: Clip UUID
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      responses:
+        '200':
+          description: Raw Suno clip object
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/extend_audio:
+    post:
+      tags: [Audio Management]
+      summary: Extend an existing clip
+      description: |
+        Continue an existing audio clip from a specified timestamp, optionally with
+        new lyrics and style tags. Creates 2 extension clips.
+        **Costs 10 credits.**
+      operationId: extendAudio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtendAudioRequest'
+            examples:
+              basic:
+                summary: Natural continuation
+                value:
+                  audio_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              withLyrics:
+                summary: With new lyrics and timestamp
+                value:
+                  audio_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  prompt: "[Bridge]\nEverything will be alright in the end"
+                  continue_at: 120
+                  tags: "acoustic, emotional"
+                  title: "My Song (Extended)"
+      responses:
+        '200':
+          description: Array of 2 extended audio clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/concat:
+    post:
+      tags: [Audio Management]
+      summary: Concatenate extended clip segments
+      description: |
+        Stitch an original clip and its extension into one seamless audio file.
+        Pass the UUID of the **extended** clip (not the original).
+        **Costs 5 credits.**
+      operationId: concatAudio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConcatRequest'
+            examples:
+              basic:
+                summary: Concatenate clips
+                value:
+                  clip_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+      responses:
+        '200':
+          description: Single concatenated audio clip
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/generate_stems:
+    post:
+      tags: [Audio Management]
+      summary: Extract vocal and instrumental stems
+      description: |
+        Separate a completed audio clip into vocal and instrumental stem tracks.
+      operationId: generateStems
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateStemsRequest'
+            examples:
+              basic:
+                summary: Extract stems
+                value:
+                  audio_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  wait_audio: false
+      responses:
+        '200':
+          description: Array of stem audio clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/get_aligned_lyrics:
+    get:
+      tags: [Lyrics]
+      summary: Get time-stamped lyric alignment
+      description: |
+        Returns word-level lyric timing data for a completed clip.
+        The clip must have `status: complete`.
+        **Free.**
+      operationId: getAlignedLyrics
+      parameters:
+        - name: song_id
+          in: query
+          description: UUID of a completed clip
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      responses:
+        '200':
+          description: Array of time-aligned words
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AlignedWord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # ACCOUNT
+  # ─────────────────────────────────────────────
+
+  /api/get_limit:
+    get:
+      tags: [Account]
+      summary: Get account credits and billing info
+      description: |
+        Returns current credit balance, billing period, and usage statistics.
+        **Free.**
+      operationId: getLimit
+      responses:
+        '200':
+          description: Credits and billing information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # MODELS
+  # ─────────────────────────────────────────────
+
+  /api/models:
+    get:
+      tags: [Models]
+      summary: List available Suno models
+      description: |
+        Returns all available Suno models along with the auto-detected default model.
+        **Free.**
+      operationId: getModels
+      responses:
+        '200':
+          description: Available models and default selection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # PERSONA
+  # ─────────────────────────────────────────────
+
+  /api/persona:
+    get:
+      tags: [Persona]
+      summary: Get persona details for voice cloning
+      description: |
+        Returns metadata and associated clips for a voice-cloning persona.
+        **Free.**
+      operationId: getPersona
+      parameters:
+        - name: id
+          in: query
+          description: Persona UUID
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          description: Page number (default 1)
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        '200':
+          description: Persona metadata and associated clips
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonaResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # ASSETS
+  # ─────────────────────────────────────────────
+
+  /api/generated_assets:
+    get:
+      tags: [Assets]
+      summary: List locally stored generated assets
+      description: |
+        Returns in-memory records of assets generated during this server session.
+        Supports filtering by asset UUID or generation source.
+        **Free.**
+      operationId: getGeneratedAssets
+      parameters:
+        - name: id
+          in: query
+          description: Filter by a specific asset UUID (returns single object)
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: source
+          in: query
+          description: Filter by generation source
+          required: false
+          schema:
+            $ref: '#/components/schemas/AssetSource'
+        - name: limit
+          in: query
+          description: Maximum number of results to return
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Asset list or single asset object
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/GeneratedAssetsListResponse'
+                  - $ref: '#/components/schemas/GeneratedAsset'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # UTILITY
+  # ─────────────────────────────────────────────
+
+  /api/test_browser:
+    get:
+      tags: [Utility]
+      summary: Test browser launch and CAPTCHA solving
+      description: |
+        Launches a browser instance and attempts to retrieve a Clerk CAPTCHA token.
+        Use to verify server configuration before running generation tasks.
+      operationId: testBrowser
+      responses:
+        '200':
+          description: Browser test result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestBrowserResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # AUDIO ANALYSIS & STYLE CLONING
+  # ─────────────────────────────────────────────
+
+  /api/analyze_audio:
+    post:
+      tags: [Generation]
+      summary: Analyze your own audio file and extract style info
+      description: |
+        Upload your own audio file (or provide a URL) to extract BPM, musical key,
+        genre tags, and duration from its embedded metadata (ID3/Vorbis/MP4 tags).
+
+        Returns `suggested_tags` and `suggested_prompt` that are ready to pass
+        directly to `POST /api/custom_generate` or `POST /api/generate_from_audio`.
+
+        **Accepts either:**
+        - `multipart/form-data` with a `file` field (max 50 MB)
+        - `application/json` with a `url` field pointing to a remote audio file
+
+        **Note:** BPM and key are only extracted when they are embedded in the file's
+        tags (common for files exported from DAWs or tagged in iTunes/MusicBrainz).
+        Files without embedded tags will return `null` for those fields.
+      operationId: analyzeAudio
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Audio file to analyze (mp3, wav, flac, ogg, m4a, aac …)
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  description: Public URL of the audio file to analyze.
+                  example: "https://example.com/my-song.mp3"
+      responses:
+        '200':
+          description: Extracted audio analysis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioAnalysis'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          description: File too large (over 50 MB)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/generate_from_audio:
+    post:
+      tags: [Generation]
+      summary: Analyze your audio then generate a similar song in Suno
+      description: |
+        One-shot endpoint: provide your own audio file or URL, and the API will:
+        1. Extract BPM, key, genre, and other style attributes from its metadata
+        2. Build Suno-compatible tags automatically
+        3. Call `custom_generate` with those tags (plus any overrides you provide)
+        4. Return both the `analysis` and the generated `clips`
+
+        **Accepts either:**
+        - `multipart/form-data` with a `file` field + optional text fields
+        - `application/json` with a `url` field + optional override fields
+
+        **Costs 10 credits.**
+      operationId: generateFromAudio
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/GenerateFromAudioForm'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateFromAudioJson'
+            examples:
+              urlOnly:
+                summary: URL only — fully automatic
+                value:
+                  url: "https://example.com/my-song.mp3"
+              urlWithOverrides:
+                summary: URL with custom lyrics and extra tags
+                value:
+                  url: "https://example.com/my-song.mp3"
+                  title: "My New Track"
+                  prompt: "[Verse]\nNew lyrics here\n[Chorus]\nFeel the vibe"
+                  extra_tags: "dark, melancholic"
+                  wait_audio: true
+      responses:
+        '200':
+          description: Analysis result and generated clips
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateFromAudioResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '413':
+          description: File too large (over 50 MB)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ─────────────────────────────────────────────
+  # OPENAI-COMPATIBLE
+  # ─────────────────────────────────────────────
+
+  /v1/chat/completions:
+    post:
+      tags: [OpenAI-Compatible]
+      summary: OpenAI-compatible chat completions
+      description: |
+        Drop-in replacement for OpenAI's `/v1/chat/completions` endpoint.
+        Interprets the last user message as a song request, generates a track,
+        and returns a markdown response with title, lyrics, and audio URL.
+        **Costs 10 credits.**
+      operationId: chatCompletions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionsRequest'
+            examples:
+              basic:
+                summary: Simple song request
+                value:
+                  messages:
+                    - role: "user"
+                      content: "Create a jazz song about a rainy afternoon in Paris"
+      responses:
+        '200':
+          description: OpenAI-format chat completion with song details in markdown
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+# ─────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────
+
+components:
+
+  schemas:
+
+    # ── Request Bodies ──────────────────────────
+
+    GenerateRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: Plain-text song description. Suno writes the lyrics automatically.
+          example: "An upbeat pop song about summer vacation on the beach"
+        make_instrumental:
+          type: boolean
+          description: Generate without vocals
+          default: false
+        model:
+          type: string
+          description: Suno model ID. Defaults to the auto-detected latest model.
+          example: "chirp-crow"
+        wait_audio:
+          type: boolean
+          description: |
+            Block until audio URLs are ready. If false (default), returns immediately
+            with `status: submitted` and you must poll `/api/get`.
+          default: false
+
+    CustomGenerateRequest:
+      type: object
+      required: [prompt, tags, title]
+      properties:
+        prompt:
+          type: string
+          description: |
+            Full lyrics with section markers. Use `[Verse]`, `[Chorus]`, `[Bridge]`,
+            `[Outro]` etc. to structure the song.
+          example: "[Verse]\nWalking down the neon streets at night\n[Chorus]\nCity lights are burning bright"
+        tags:
+          type: string
+          description: Comma-separated style/genre tags describing the desired sound.
+          example: "synthwave, electronic, 80s, retro"
+        title:
+          type: string
+          description: Song title (3–6 words recommended).
+          example: "Neon City Dreams"
+        make_instrumental:
+          type: boolean
+          description: Generate without vocals
+          default: false
+        model:
+          type: string
+          description: Suno model ID. Defaults to the auto-detected latest model.
+          example: "chirp-crow"
+        wait_audio:
+          type: boolean
+          description: Block until audio URLs are ready.
+          default: false
+        negative_tags:
+          type: string
+          description: Comma-separated styles to exclude from generation.
+          example: "heavy metal, distortion, noise"
+        vocal_gender:
+          type: string
+          enum: [male, female]
+          description: Preferred vocal gender.
+        weirdness:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Creativity / unpredictability level. 0 = conventional, 100 = avant-garde, 50 = balanced.
+          default: 50
+        style_influence:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: How strictly the tags influence the output. 0 = loose, 100 = strict, 50 = balanced.
+          default: 50
+        persona_id:
+          type: string
+          format: uuid
+          description: Voice-cloning persona UUID for custom vocal timbre.
+
+    GenerateSimilarRequest:
+      type: object
+      required: [reference_audio_id]
+      properties:
+        reference_audio_id:
+          type: string
+          format: uuid
+          description: UUID of the existing Suno clip to use as a style reference.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        prompt:
+          type: string
+          description: |
+            New lyrics for the generated song. Omit to let Suno derive lyrics
+            automatically from the reference clip's style.
+          example: "[Verse]\nNew words in the same vibe\n[Chorus]\nKeep that feeling alive"
+        tags:
+          type: string
+          description: |
+            Style/genre tags. Omit to inherit the reference clip's style automatically.
+          example: "synthwave, melancholic, 80s"
+        title:
+          type: string
+          description: Title for the new song. Defaults to empty if not provided.
+          example: "Echoes of the Original"
+        make_instrumental:
+          type: boolean
+          description: Generate without vocals.
+          default: false
+        model:
+          type: string
+          description: Suno model ID. Defaults to the auto-detected latest model.
+          example: "chirp-crow"
+        wait_audio:
+          type: boolean
+          description: Block until audio URLs are ready.
+          default: false
+        negative_tags:
+          type: string
+          description: Comma-separated styles to exclude.
+          example: "heavy metal, distortion"
+        vocal_gender:
+          type: string
+          enum: [male, female]
+          description: Preferred vocal gender.
+        weirdness:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Creativity level. 0 = conventional, 100 = avant-garde, 50 = balanced.
+          default: 50
+        style_influence:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: How strictly tags influence the output. 50 = balanced.
+          default: 50
+        persona_id:
+          type: string
+          format: uuid
+          description: Voice-cloning persona UUID.
+
+    AudioAnalysis:
+      type: object
+      description: Style attributes extracted from an audio file's embedded metadata.
+      properties:
+        bpm:
+          type: integer
+          nullable: true
+          description: Detected BPM rounded to nearest integer. Null if not embedded in file tags.
+          example: 128
+        bpm_label:
+          type: string
+          enum: [slow, medium, fast, very fast]
+          description: Human-readable tempo category derived from BPM.
+          example: "fast"
+        key:
+          type: string
+          nullable: true
+          description: Musical key (e.g. "C major", "A minor"). Null if not embedded.
+          example: "C major"
+        genre:
+          type: array
+          items:
+            type: string
+          description: Genre tags extracted from file metadata.
+          example: ["Electronic", "Synthwave"]
+        duration:
+          type: integer
+          nullable: true
+          description: Track duration in seconds.
+          example: 214
+        format:
+          type: string
+          nullable: true
+          description: Audio container format.
+          example: "mp3"
+        artist:
+          type: string
+          nullable: true
+          description: Artist name from file tags.
+          example: "My Band"
+        title:
+          type: string
+          nullable: true
+          description: Track title from file tags.
+          example: "My Song"
+        suggested_tags:
+          type: string
+          description: Ready-to-use Suno style tags string built from all detected attributes.
+          example: "Electronic, Synthwave, 128 bpm, C major, fast"
+        suggested_prompt:
+          type: string
+          description: Ready-to-use Suno description built from detected attributes.
+          example: "Electronic, Synthwave style, 128 BPM, key of C major"
+
+    GenerateFromAudioForm:
+      type: object
+      description: Multipart form fields for generate_from_audio.
+      required: [file]
+      properties:
+        file:
+          type: string
+          format: binary
+          description: Your audio file (mp3, wav, flac, ogg, m4a …). Max 50 MB.
+        title:
+          type: string
+          description: Song title. Falls back to the title embedded in the file, then "Generated Song".
+        prompt:
+          type: string
+          description: Custom lyrics with section markers. Omit to generate without explicit lyrics.
+        extra_tags:
+          type: string
+          description: Additional style tags appended to the auto-detected ones.
+          example: "dark, cinematic"
+        tags_override:
+          type: string
+          description: Fully replace the auto-detected tags with this value.
+          example: "jazz, piano, slow"
+        negative_tags:
+          type: string
+          description: Styles to exclude.
+        model:
+          type: string
+          description: Suno model ID.
+        wait_audio:
+          type: string
+          enum: ["true", "false"]
+          default: "false"
+          description: Pass "true" to block until audio URLs are ready.
+        make_instrumental:
+          type: string
+          enum: ["true", "false"]
+          default: "false"
+          description: Pass "true" to generate without vocals.
+        vocal_gender:
+          type: string
+          enum: [male, female]
+        weirdness:
+          type: string
+          description: Integer 0–100 as a string.
+        style_influence:
+          type: string
+          description: Integer 0–100 as a string.
+        persona_id:
+          type: string
+          description: Voice-cloning persona UUID.
+
+    GenerateFromAudioJson:
+      type: object
+      description: JSON body for generate_from_audio when providing a remote audio URL.
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Public URL of your audio file to analyze and use as style reference.
+          example: "https://example.com/my-song.mp3"
+        title:
+          type: string
+          description: Song title override.
+        prompt:
+          type: string
+          description: Custom lyrics with section markers.
+        extra_tags:
+          type: string
+          description: Additional tags appended to auto-detected ones.
+          example: "dark, cinematic"
+        tags_override:
+          type: string
+          description: Fully replace auto-detected tags.
+          example: "jazz, piano, slow"
+        negative_tags:
+          type: string
+          description: Styles to exclude.
+        model:
+          type: string
+          description: Suno model ID.
+        wait_audio:
+          type: boolean
+          default: false
+        make_instrumental:
+          type: boolean
+          default: false
+        vocal_gender:
+          type: string
+          enum: [male, female]
+        weirdness:
+          type: integer
+          minimum: 0
+          maximum: 100
+        style_influence:
+          type: integer
+          minimum: 0
+          maximum: 100
+        persona_id:
+          type: string
+          format: uuid
+
+    GenerateFromAudioResponse:
+      type: object
+      properties:
+        analysis:
+          $ref: '#/components/schemas/AudioAnalysis'
+        clips:
+          type: array
+          items:
+            $ref: '#/components/schemas/AudioInfo'
+
+    GenerateSoundsRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: Description of the desired sound effect.
+          example: "Heavy rain on a tin roof with distant thunder"
+        make_instrumental:
+          type: boolean
+          description: Always true for sounds; override not recommended.
+          default: true
+        model:
+          type: string
+          description: Suno model ID. Defaults to the auto-detected latest model.
+        wait_audio:
+          type: boolean
+          description: Block until audio URLs are ready.
+          default: false
+
+    GenerateLyricsRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: Theme, concept, or brief description of the desired lyrics.
+          example: "A song about missing someone who moved far away"
+
+    ExtendAudioRequest:
+      type: object
+      required: [audio_id]
+      properties:
+        audio_id:
+          type: string
+          format: uuid
+          description: UUID of the clip to extend.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        prompt:
+          type: string
+          description: New lyrics for the extension section. Omit for a natural continuation.
+          example: "[Bridge]\nEverything will be alright in the end"
+        continue_at:
+          type: number
+          description: Timestamp in seconds to start the extension from. Defaults to the clip's end.
+          example: 120
+        tags:
+          type: string
+          description: Style tags for the extension segment.
+          example: "acoustic, emotional, slow"
+        negative_tags:
+          type: string
+          description: Styles to exclude from the extension.
+        title:
+          type: string
+          description: Title for the extended clip.
+        model:
+          type: string
+          description: Suno model ID. Defaults to the auto-detected latest model.
+        wait_audio:
+          type: boolean
+          description: Block until audio URLs are ready.
+          default: false
+
+    ConcatRequest:
+      type: object
+      required: [clip_id]
+      properties:
+        clip_id:
+          type: string
+          format: uuid
+          description: UUID of the **extended** clip (not the original) to concatenate with its parent.
+          example: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+
+    GenerateStemsRequest:
+      type: object
+      required: [audio_id]
+      properties:
+        audio_id:
+          type: string
+          format: uuid
+          description: UUID of a completed audio clip to separate into stems.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        wait_audio:
+          type: boolean
+          description: Block until stem URLs are ready.
+          default: false
+
+    ChatCompletionsRequest:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          description: Conversation messages. The last `user` message is used as the song prompt.
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+          minItems: 1
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, system, assistant]
+        content:
+          type: string
+          description: Message text. For `user` role, describe the song you want.
+          example: "Create a jazz song about a rainy afternoon in Paris"
+
+    # ── Response Bodies ─────────────────────────
+
+    AudioInfo:
+      type: object
+      description: Core audio clip object returned by all generation and retrieval endpoints.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique clip identifier.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        title:
+          type: string
+          description: Song title.
+          example: "Neon City Dreams"
+        image_url:
+          type: string
+          format: uri
+          description: Cover art image URL.
+          example: "https://cdn2.suno.ai/image_a1b2c3d4.jpeg"
+        lyric:
+          type: string
+          description: Full formatted lyrics with section markers.
+        audio_url:
+          type: string
+          format: uri
+          description: MP3 CDN URL. Available when `status` is `complete` or `streaming`.
+          example: "https://cdn1.suno.ai/a1b2c3d4.mp3"
+        video_url:
+          type: string
+          format: uri
+          description: MP4 URL with waveform visualization. Available when `status` is `complete`.
+          example: "https://cdn1.suno.ai/a1b2c3d4.mp4"
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 creation timestamp.
+          example: "2026-04-17T12:00:00.000Z"
+        model_name:
+          type: string
+          description: Model used for generation.
+          example: "chirp-crow"
+        gpt_description_prompt:
+          type: string
+          description: Internal GPT prompt used in auto-mode generation.
+        prompt:
+          type: string
+          description: Original lyrics or description prompt submitted to Suno.
+        status:
+          type: string
+          enum: [submitted, queued, streaming, complete, error]
+          description: Current clip processing status.
+          example: "complete"
+        type:
+          type: string
+          description: Clip type identifier (e.g. `gen`, `stem`, `concat`).
+        tags:
+          type: string
+          description: Style tags applied during generation.
+          example: "synthwave, electronic, 80s"
+        negative_tags:
+          type: string
+          description: Style tags that were excluded.
+          example: "heavy metal, distortion"
+        duration:
+          type: string
+          description: Clip duration in seconds (as a string).
+          example: "185.4"
+        error_message:
+          type: string
+          description: Human-readable error description. Only present when `status` is `error`.
+        aligned_lyrics:
+          type: array
+          description: Word-level timing data. Populated by `/api/get_aligned_lyrics`.
+          items:
+            $ref: '#/components/schemas/AlignedWord'
+
+    AlignedWord:
+      type: object
+      description: A single word with its start/end timestamps from lyric alignment.
+      properties:
+        word:
+          type: string
+          description: The lyric word.
+          example: "City"
+        start_s:
+          type: number
+          format: float
+          description: Word start time in seconds.
+          example: 12.34
+        end_s:
+          type: number
+          format: float
+          description: Word end time in seconds.
+          example: 12.78
+        success:
+          type: boolean
+          description: Whether alignment succeeded for this word.
+        p_align:
+          type: number
+          format: float
+          description: Alignment confidence probability (0–1).
+          example: 0.97
+
+    LyricsResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Lyrics task identifier.
+        title:
+          type: string
+          description: Generated song title suggestion.
+          example: "Missing You"
+        text:
+          type: string
+          description: Full generated lyrics with section markers.
+          example: "[Verse]\nEmpty chair at the kitchen table\n[Chorus]\nMissing you every day"
+        status:
+          type: string
+          enum: [complete]
+          example: "complete"
+
+    LimitResponse:
+      type: object
+      properties:
+        credits_left:
+          type: integer
+          description: Current available credits.
+          example: 450
+        period:
+          type: string
+          enum: [monthly, daily]
+          description: Billing period type.
+          example: "monthly"
+        monthly_limit:
+          type: integer
+          description: Total credits allocated for the billing period.
+          example: 2500
+        monthly_usage:
+          type: integer
+          description: Credits consumed in the current billing period.
+          example: 2050
+
+    ModelsResponse:
+      type: object
+      properties:
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInfo'
+        default_model:
+          type: string
+          description: Auto-detected default model ID to use for new generations.
+          example: "chirp-crow"
+        fallback_model:
+          type: string
+          description: Fallback model ID if default detection fails.
+          example: "chirp-v3"
+        auto_detected:
+          type: boolean
+          description: Whether the default model was auto-detected from the Suno API.
+        error:
+          type: string
+          description: Error message if model detection failed (non-fatal).
+        raw_response:
+          description: Raw Suno API response for debugging.
+
+    ModelInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Model identifier.
+          example: "chirp-crow"
+        display_name:
+          type: string
+          nullable: true
+          description: Human-readable model name.
+          example: "Crow"
+        status:
+          type: string
+          nullable: true
+          description: Model availability status.
+          example: "active"
+        is_default:
+          type: boolean
+          description: Whether this is the current default model.
+
+    PersonaResponse:
+      type: object
+      description: Voice-cloning persona metadata and associated clips.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Persona UUID.
+        name:
+          type: string
+          description: Persona display name.
+        clips:
+          type: array
+          description: Audio clips associated with this persona.
+          items:
+            $ref: '#/components/schemas/AudioInfo'
+        page:
+          type: integer
+          description: Current page number.
+        total:
+          type: integer
+          description: Total number of associated clips.
+
+    GeneratedAssetsListResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total number of matching assets.
+          example: 42
+        assets:
+          type: array
+          items:
+            $ref: '#/components/schemas/GeneratedAsset'
+
+    GeneratedAsset:
+      type: object
+      description: Locally stored record of a generated asset for this server session.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Asset (clip) UUID.
+        title:
+          type: string
+          description: Song title.
+        image_url:
+          type: string
+          format: uri
+          description: Cover art URL.
+        audio_url:
+          type: string
+          format: uri
+          description: MP3 audio URL.
+        video_url:
+          type: string
+          format: uri
+          description: MP4 video URL.
+        model_name:
+          type: string
+          description: Model used for generation.
+        tags:
+          type: string
+          description: Style tags.
+        duration:
+          type: string
+          description: Duration in seconds as a string.
+        status:
+          type: string
+          enum: [submitted, queued, streaming, complete, error]
+        source:
+          $ref: '#/components/schemas/AssetSource'
+        created_at:
+          type: string
+          format: date-time
+          description: Clip creation time from Suno.
+        recorded_at:
+          type: string
+          format: date-time
+          description: Time this asset was recorded in the local store.
+
+    AssetSource:
+      type: string
+      enum:
+        - generate
+        - custom_generate
+        - generate_sounds
+        - extend_audio
+        - generate_stems
+        - concatenate
+      description: The API endpoint that produced this asset.
+
+    TestBrowserResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          description: Whether the browser test passed.
+        message:
+          type: string
+          description: Human-readable result description.
+          example: "Browser launched and CAPTCHA token retrieved successfully"
+        captcha_token_retrieved:
+          type: boolean
+          description: Whether a valid Clerk CAPTCHA token was obtained.
+
+    ChatCompletionsResponse:
+      type: object
+      description: OpenAI-format chat completion response.
+      properties:
+        id:
+          type: string
+          description: Completion ID.
+          example: "chatcmpl-abc123"
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          description: Unix timestamp of creation.
+        model:
+          type: string
+          description: Model identifier.
+          example: "suno-ai"
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: [assistant]
+                  content:
+                    type: string
+                    description: Markdown response with song title, lyrics, and audio URL.
+              finish_reason:
+                type: string
+                enum: [stop]
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+          example: "Missing required parameter: prompt"
+
+  # ── Reusable Responses ───────────────────────
+
+  responses:
+    BadRequest:
+      description: Missing or invalid request parameter
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Missing required parameter: prompt"
+
+    InsufficientCredits:
+      description: Insufficient Suno account credits
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Insufficient credits. Please upgrade your Suno plan."
+
+    UnprocessableEntity:
+      description: Invalid payload — usually a stale or invalid SUNO_COOKIE
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Invalid session. Please refresh your SUNO_COOKIE."
+
+    TooManyRequests:
+      description: Rate limited by Suno API
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "Rate limited by Suno. Please try again later."
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "An unexpected error occurred."

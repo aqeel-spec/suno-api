@@ -2789,6 +2789,40 @@ class SunoApi {
   }
 
   /**
+   * Generate a new song inspired by a reference clip.
+   * Passes the reference clip ID as continue_clip_id with continue_at=0 so Suno
+   * uses it as a style anchor while producing a fresh composition.
+   */
+  public async generateSimilar(
+    referenceAudioId: string,
+    prompt: string = '',
+    tags: string = '',
+    title: string = '',
+    make_instrumental: boolean = false,
+    model?: string,
+    wait_audio: boolean = false,
+    negative_tags?: string,
+    advanced?: AdvancedOptions
+  ): Promise<AudioInfo[]> {
+    const audios = await this.generateSongs(
+      prompt,
+      true,
+      tags,
+      title,
+      make_instrumental,
+      model,
+      wait_audio,
+      negative_tags,
+      'extend',
+      referenceAudioId,
+      0,
+      advanced
+    );
+    recordAssets(audios, 'custom_generate');
+    return audios;
+  }
+
+  /**
    * Generate stems for a song.
    * @param song_id The ID of the song to generate stems for.
    * @returns A promise that resolves to an AudioInfo object representing the generated stems.
